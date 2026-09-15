@@ -50,13 +50,21 @@ export function projectInferenceRouterTranscriptEntry(entry: StoredEntry): Recor
 }
 
 export function mergeInferenceRouterTranscriptEntries(remote: readonly unknown[], local: readonly unknown[]): unknown[] {
-  const seenIds = new Set<string>(), reversed: unknown[] = [], merged = [...remote, ...local];
-  for (let index = merged.length - 1; index >= 0; index -= 1) {
-    const entry = merged[index], id = asRecord(entry)?.id;
-    if (typeof id === "string" && id.length > 0) { if (seenIds.has(id)) continue; seenIds.add(id); }
-    reversed.push(entry);
+  const localById = new Map<string, unknown>(), emittedIds = new Set<string>(), merged: unknown[] = [];
+  for (const entry of local) { const id = asRecord(entry)?.id; if (typeof id === "string" && id.length > 0) localById.set(id, entry); }
+  for (const entry of remote) {
+    const id = asRecord(entry)?.id;
+    if (typeof id !== "string" || id.length === 0) { merged.push(entry); continue; }
+    if (emittedIds.has(id)) continue;
+    emittedIds.add(id); merged.push(localById.get(id) ?? entry);
   }
-  return reversed.reverse();
+  for (const entry of local) {
+    const id = asRecord(entry)?.id;
+    if (typeof id !== "string" || id.length === 0) { merged.push(entry); continue; }
+    if (emittedIds.has(id)) continue;
+    emittedIds.add(id); merged.push(localById.get(id));
+  }
+  return merged;
 }
 
 export function createCoordinatorInferenceRouter(options: {

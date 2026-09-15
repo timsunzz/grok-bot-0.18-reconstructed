@@ -81,12 +81,13 @@ test("routed transcript merge keeps the local version of duplicate entries", asy
     const duplicateRemote = { id: "t2s0", content: "stale remote" };
     const duplicateLocal = { id: "t2s0", content: "authoritative local" };
     const withoutId = { content: "status row" };
+    const newerRemote = { id: "t3u", content: "newer remote" };
     assert.deepEqual(
       loaded.module.mergeInferenceRouterTranscriptEntries(
-        [remoteOnly, duplicateRemote, withoutId],
+        [remoteOnly, duplicateRemote, withoutId, newerRemote],
         [duplicateLocal],
       ),
-      [remoteOnly, withoutId, duplicateLocal],
+      [remoteOnly, duplicateLocal, withoutId, newerRemote],
     );
   } finally {
     await loaded.dispose();
