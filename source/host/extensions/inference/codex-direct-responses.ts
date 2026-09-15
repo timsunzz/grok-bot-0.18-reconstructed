@@ -31,6 +31,10 @@ export type CodexDirectOptions = {
   readonly executeTool?: (tool: CodexDirectTool, args: unknown, toolCallId: string) => Promise<unknown>;
   readonly maxSteps?: number;
   readonly signal?: AbortSignal;
+  // Called for every event the provider sends, including the ones this transport handles without
+  // reporting them onward — reasoning summaries among them. A caller enforcing a deadline needs to
+  // know the difference between a model thinking and a stream that has died.
+  readonly onActivity?: () => void;
 };
 
 function record(value: unknown): Loose | null {
@@ -155,6 +159,7 @@ export async function* streamCodexDirectResponses(options: CodexDirectOptions): 
     let completed: Loose | null = null;
     const observedOutput: Loose[] = [];
     for await (const event of sseEvents(response)) {
+      options.onActivity?.();
       if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
         text += event.delta;
         yield { type: "text-delta", delta: event.delta };

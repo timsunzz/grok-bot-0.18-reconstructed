@@ -26,14 +26,20 @@ A prompt whose turn failed is not: resending it is how a person retries, and the
 desktop's resend reuses the nonce. A reused nonce carrying different text always
 runs, because dropping a real message is worse than an extra turn.
 
-**A turn ends.** Every routed provider request carries a deadline (ten minutes,
-covering tool steps), and it aborts the request rather than only abandoning it.
-Without one, a provider that stopped answering without closing its socket left
-the turn pending for the life of the process — and because the coordinator runs
-one routed turn per agent at a time, that turn swallowed every later prompt for
-that agent. The deadline is deliberately not an `AbortError` or `TimeoutError`,
-because those are how a cancelled turn arrives and a cancelled turn is never
-retried.
+**A turn that has stopped moving ends.** What every routed provider request
+carries is a bound on *silence*, not on duration: three minutes with nothing at
+all from the provider (`SAND_ROUTED_IDLE_TIMEOUT_MS` to change it), and it aborts
+the request rather than only abandoning it. Without one, a provider that stopped
+answering without closing its socket left the turn pending for the life of the
+process — and because the coordinator runs one routed turn per agent at a time,
+that turn swallowed every later prompt for that agent. A total-duration cap would
+have traded that for a new failure, since a turn that reasons at length and then
+works through eight tool steps is working. So anything the provider sends resets
+the window, down to a reasoning delta the transports otherwise keep to
+themselves, and so does a plugin call running on the provider's behalf. The same
+deadline covers the host's own agent turns, not just the coordinator's routed
+ones. It is deliberately not an `AbortError` or `TimeoutError`, because those are
+how a cancelled turn arrives and a cancelled turn is never retried.
 
 **At most one retry, and only when a retry could change the answer.** Rate
 limits, server errors, unreachable providers and malformed streams are retried
@@ -58,9 +64,11 @@ re-trips it. The wait is jittered so concurrent turns do not resynchronise on th
 same instant, and a wait longer than a foreground turn can hide (30s) fails with
 its reason instead of stalling behind a sleep nobody can see or cancel.
 `Retry-After: 0` is treated as absent so it cannot hot-loop the provider that just
-refused us. The AI SDK's own two retries are turned off for routed turns, since
-they run back to back inside a single attempt, before any header is read, and
-would make one rate-limited turn cost six provider requests.
+refused us. Where the router retries — the coordinator's routed turns — the AI
+SDK's own two retries are turned off, since they run back to back inside a single
+attempt, before any header is read, and would make one rate-limited turn cost six
+provider requests. The host's agent turns have no router retry above them, so
+there the SDK keeps its own.
 
 **A broken plugin stops costing steps.** After three consecutive failures, a
 per-plugin breaker answers tool calls itself for a minute, then lets exactly one
@@ -141,8 +149,9 @@ that nothing above emits a span today.
 
 ## What is still not guaranteed
 
-- A retried attempt has its own full deadline, so a turn that times out twice can
-  take twice as long before it reports. The bound exists; it is not tight.
+- Nothing bounds a turn's total duration, only its silences, and the retried
+  attempt gets a fresh window of its own. A provider that keeps talking without
+  finishing is not something this stops.
 - The breaker's state lives in one turn's closure. A plugin that fails every call
   is rediscovered by the next turn, which is deliberate — a person who fixes a
   plugin should not have to wait out a cooldown — but it means the first few

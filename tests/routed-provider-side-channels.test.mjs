@@ -134,23 +134,29 @@ test("abandoning a routed stream settles its side channels instead of hanging", 
   }
 });
 
+// A response that opens its stream, sends whatever it is given, and then says nothing more. The
+// socket stays up, so no network error ever arrives.
+function goesQuiet(...events) {
+  return (_url, init) => {
+    goesQuiet.signal = init.signal;
+    return Promise.resolve(sse(new ReadableStream({
+      start(controller) {
+        for (const event of events) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+      },
+    })));
+  };
+}
+
 test("a provider that stops responding loses its turn instead of holding the queue", { timeout: 30_000 }, async () => {
   const loaded = await loadProviderSession();
   try {
-    let requestSignal = null;
-    // A response that opens its stream and then says nothing more: the socket stays up, so no
-    // network error ever arrives. The coordinator runs one routed turn per agent at a time, so a
-    // turn that waits here forever silently swallows every later prompt for that agent.
-    const silent = (_url, init) => {
-      requestSignal = init.signal;
-      return Promise.resolve(sse(new ReadableStream({ start() {} })));
-    };
-
+    // The coordinator runs one routed turn per agent at a time, so a turn that waits here forever
+    // silently swallows every later prompt for that agent.
     const started = Date.now();
     let failure = null;
-    const observed = await withoutUnhandledRejections(() => withStubbedFetch(silent, async () => {
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(goesQuiet(), async () => {
       await assert.rejects(
-        loaded.module.runRoutedProviderText("codex", [{ role: "user", content: "hi" }], { timeoutMs: 500 }),
+        loaded.module.runRoutedProviderText("codex", [{ role: "user", content: "hi" }], { idleTimeoutMs: 500 }),
         (error) => { failure = error; return true; },
       );
     }));
@@ -158,7 +164,7 @@ test("a provider that stops responding loses its turn instead of holding the que
     assert.ok(Date.now() - started < 10_000, `gave up after ${Date.now() - started}ms`);
     assert.match(failure.message, /stopped responding/);
     // The provider request has to be closed too, or the turn is abandoned while its socket is not.
-    assert.equal(requestSignal.aborted, true);
+    assert.equal(goesQuiet.signal.aborted, true);
     // `AbortError` and `TimeoutError` are how a person cancelling a turn arrives, and a cancelled
     // turn is deliberately not retried. A deadline this app imposed is the transient case the
     // retry exists for, so it must not be mistaken for one.
@@ -166,6 +172,66 @@ test("a provider that stops responding loses its turn instead of holding the que
     assert.equal(loaded.classify(failure), "provider_unavailable");
     assert.deepEqual(observed, []);
   } finally {
+    await loaded.dispose();
+  }
+});
+
+test("a provider still working is not mistaken for one that has stopped", { timeout: 30_000 }, async () => {
+  const loaded = await loadProviderSession();
+  try {
+    // Reasoning summaries are the provider's own account of a model that is thinking. This
+    // transport handles them without reporting them onward, so a deadline watching only the text it
+    // forwards sees a silence that is not there — and a total-duration cap sees one whatever
+    // arrives. Six of these outlast the window three times over.
+    const reasoning = Array.from({ length: 6 }, (_, index) => ({ type: "response.reasoning_summary_text.delta", delta: `step ${index}` }));
+    const thinking = (_url, init) => Promise.resolve(sse(new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        for (const event of reasoning) {
+          if (init.signal?.aborted === true) break;
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        }
+        controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"here you go"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"response.completed","response":{"id":"resp-1","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'));
+        controller.close();
+      },
+    })));
+
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(thinking, async () => {
+      const answer = await loaded.module.runRoutedProviderText("codex", [{ role: "user", content: "hi" }], { idleTimeoutMs: 250 });
+      assert.equal(answer, "here you go");
+    }));
+
+    assert.deepEqual(observed, []);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("the host's own agent turns get the same deadline", { timeout: 30_000 }, async () => {
+  const loaded = await loadProviderSession();
+  try {
+    // Host agent turns are built through the prompt session rather than `runRoutedProviderText`,
+    // and a provider that goes quiet strands them just as thoroughly: the turn never reports, and
+    // nothing downstream can tell that from a model taking its time.
+    process.env.SAND_ROUTED_IDLE_TIMEOUT_MS = "500";
+    const started = Date.now();
+    let failure = null;
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(goesQuiet({ type: "response.output_text.delta", delta: "half an ans" }), async () => {
+      const session = loaded.module.createProviderPromptSession("codex");
+      const result = session.getExecutor().stream(undefined, "invocation-1");
+      await assert.rejects(async () => {
+        for await (const _event of result.fullStream) { /* drain until the provider stops */ }
+      }, (error) => { failure = error; return true; });
+    }));
+
+    assert.ok(Date.now() - started < 10_000, `gave up after ${Date.now() - started}ms`);
+    assert.equal(failure.name, "RoutedTurnTimeoutError");
+    assert.equal(goesQuiet.signal.aborted, true);
+    assert.deepEqual(observed, []);
+  } finally {
+    delete process.env.SAND_ROUTED_IDLE_TIMEOUT_MS;
     await loaded.dispose();
   }
 });
