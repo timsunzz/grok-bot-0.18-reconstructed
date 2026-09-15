@@ -102,6 +102,15 @@ test("a read that fails is not mistaken for corruption", async () => {
     assert.throws(() => store.setThemePreference("dark"), /EISDIR/);
     assert.deepEqual((await readdir(path.dirname(settingsPath))).filter((name) => name.includes(".unreadable-")), []);
     assert.ok((await stat(settingsPath)).isDirectory(), "the unreadable path must be left alone");
+
+    // Reading is a different matter. Electron main resolves the theme before it has a window to
+    // report anything in, and the coordinator reads the permission ceiling from a promise nobody
+    // awaits, so a getter that throws here takes the process down instead of the preference.
+    assert.equal(store.getThemePreference(), "system");
+    assert.equal(store.getInferenceProvider(), "cursor");
+    assert.doesNotThrow(() => store.getNotificationConfig());
+    assert.doesNotThrow(() => store.getUpdateTrackOverride());
+    assert.ok((await stat(settingsPath)).isDirectory(), "a read must not have written anything either");
   } finally {
     await loaded.dispose();
   }

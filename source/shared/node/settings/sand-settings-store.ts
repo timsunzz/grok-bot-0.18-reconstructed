@@ -91,29 +91,43 @@ function parseSettings(value: unknown): SandStoredSettings | null {
   return result;
 }
 
+/**
+ * Which of the four things a read of `settings.json` can find, because each one licenses
+ * something different:
+ *
+ * - `absent`: nothing stored yet. Defaults, and a write may create the file.
+ * - `ok`: parsed.
+ * - `corrupt`: present, and its content is not settings this build understands — truncated by a
+ *   crash mid-write, or written by a newer schema. Defaults to read with, and a write must move
+ *   the file aside rather than overwrite it.
+ * - `unreadable`: the read itself failed. `EACCES`, `EIO`, and `EMFILE` say nothing whatever
+ *   about the content, so a write must not touch the file: the host, the coordinator, and
+ *   Electron main share it, and one process's blip would otherwise reset every preference for
+ *   all three.
+ */
+type ReadOutcome = { readonly settings: SandStoredSettings; readonly kind: "ok" | "absent" | "corrupt" } | { readonly settings: SandStoredSettings; readonly kind: "unreadable"; readonly error: unknown };
+
 export class SandSettingsStore {
   constructor(readonly settingsPath: string) {}
-  load(): SandStoredSettings { return this.read().settings; }
   /**
-   * `corrupt` separates "there is nothing here yet" from "there is something here we could not
-   * understand". Only the first may be overwritten with defaults; see `update`.
-   *
-   * A read that fails outright is neither: `EACCES`, `EIO`, and `EMFILE` say nothing about the
-   * content, so answering with defaults would let a momentary failure reset every stored
-   * preference. The host, the coordinator, and Electron main all share this file, so one
-   * process's blip would reset it for the others too. It throws instead.
+   * Reading never throws. Most of this class is getters, and they are called from places that
+   * cannot answer an exception: Electron main resolves the theme before it has a window to report
+   * anything in, and the coordinator reads the tool-permission ceiling from a fire-and-forget
+   * sync. A file that cannot be read reports defaults; refusing to write over it is what protects
+   * it, and that belongs to `update`.
    */
-  private read(): { readonly settings: SandStoredSettings; readonly corrupt: boolean } {
+  load(): SandStoredSettings { return this.read().settings; }
+  private read(): ReadOutcome {
     let raw: string;
     try { raw = readFileSync(this.settingsPath, "utf8"); }
     catch (error) {
-      if ((error as { code?: unknown }).code !== "ENOENT") throw error;
-      return { settings: emptySettings(), corrupt: false };
+      if ((error as { code?: unknown }).code === "ENOENT") return { settings: emptySettings(), kind: "absent" };
+      return { settings: emptySettings(), kind: "unreadable", error };
     }
     try {
       const parsed = parseSettings(JSON.parse(raw) as unknown);
-      return parsed == null ? { settings: emptySettings(), corrupt: true } : { settings: this.applyPendingMigrations(parsed), corrupt: false };
-    } catch { return { settings: emptySettings(), corrupt: true }; }
+      return parsed == null ? { settings: emptySettings(), kind: "corrupt" } : { settings: this.applyPendingMigrations(parsed), kind: "ok" };
+    } catch { return { settings: emptySettings(), kind: "corrupt" }; }
   }
   // A truncated file or a file written by a newer schema would otherwise be replaced by defaults
   // on the next write, losing every stored preference silently. Move it aside so it can be
@@ -141,10 +155,19 @@ export class SandSettingsStore {
       throw error;
     }
   }
+  /**
+   * The only path that writes. A mutator that returns its argument unchanged writes nothing, which
+   * is how the read-repairing getters below avoid rewriting a file that is already in order.
+   */
   private update(mutator: (settings: SandStoredSettings) => SandStoredSettings): void {
-    const { settings, corrupt } = this.read();
-    if (corrupt) this.quarantineUnreadable();
-    this.persist(mutator(settings));
+    const outcome = this.read();
+    // Persisting here would write defaults plus this one mutation over a file whose content is
+    // still intact and still wanted.
+    if (outcome.kind === "unreadable") throw outcome.error;
+    if (outcome.kind === "corrupt") this.quarantineUnreadable();
+    const next = mutator(outcome.settings);
+    if (next === outcome.settings && outcome.kind === "ok") return;
+    this.persist(next);
   }
   getHasSeenOnboarding(): boolean | undefined { return this.load().hasSeenOnboarding; }
   setHasSeenOnboarding(value: boolean): void { this.update((current) => { const { hasSeenOnboardingAccountScope: _old, ...rest } = current; return { ...rest, hasSeenOnboarding: value, ...(rest.mcpCustomInstructionsAccountScope === undefined ? {} : { hasSeenOnboardingAccountScope: rest.mcpCustomInstructionsAccountScope }) }; }); }
@@ -184,11 +207,14 @@ export class SandSettingsStore {
   getRawMcpCustomInstruction(name: string): string | undefined { return this.load().mcpCustomInstructions[name]; }
   getRawMcpCustomInstructionByServerId(id: string): string | undefined { return this.load().mcpCustomInstructionsByServerId[id]; }
   setMcpCustomInstructionByServerId(args: { serverId: string; displayName: string; value: string; mirrorLegacyName: boolean }): void { this.update((s) => { const byId = { ...s.mcpCustomInstructionsByServerId, [args.serverId]: clampMcpCustomInstruction(args.value) }; const legacy = { ...s.mcpCustomInstructions }; if (args.mirrorLegacyName) { const value = clampMcpCustomInstruction(args.value); if (value.trim().length > 0 || getDefaultMcpCustomInstruction(args.displayName).length > 0) legacy[args.displayName] = value; else delete legacy[args.displayName]; } else delete legacy[args.displayName]; return { ...s, mcpCustomInstructionsByServerId: byId, mcpCustomInstructions: legacy }; }); }
-  migrateMcpCustomInstructionToServerId(args: { serverId: string; displayName: string }): void { const current = this.load(); if (current.mcpCustomInstructionsByServerId[args.serverId] !== undefined) return; const legacy = current.mcpCustomInstructions[args.displayName]; if (legacy === undefined) return; this.persist({ ...current, mcpCustomInstructionsByServerId: { ...current.mcpCustomInstructionsByServerId, [args.serverId]: legacy } }); }
+  migrateMcpCustomInstructionToServerId(args: { serverId: string; displayName: string }): void { this.update((current) => { if (current.mcpCustomInstructionsByServerId[args.serverId] !== undefined) return current; const legacy = current.mcpCustomInstructions[args.displayName]; return legacy === undefined ? current : { ...current, mcpCustomInstructionsByServerId: { ...current.mcpCustomInstructionsByServerId, [args.serverId]: legacy } }; }); }
   deleteMcpCustomInstructionByServerId(args: { serverId: string; displayName: string; deleteLegacyName: boolean }): void { this.update((s) => { const byId = { ...s.mcpCustomInstructionsByServerId }; delete byId[args.serverId]; const legacy = { ...s.mcpCustomInstructions }; if (args.deleteLegacyName) delete legacy[args.displayName]; return { ...s, mcpCustomInstructionsByServerId: byId, mcpCustomInstructions: legacy }; }); }
   setMcpCustomInstruction(name: string, value: string): void { this.update((s) => { const next = { ...s.mcpCustomInstructions }; const clamped = clampMcpCustomInstruction(value); if (clamped.trim().length === 0) { if (getDefaultMcpCustomInstruction(name).length > 0) next[name] = ""; else delete next[name]; } else next[name] = clamped; return { ...s, mcpCustomInstructions: next }; }); }
-  deleteMcpCustomInstruction(name: string): void { const current = this.load(); if (!(name in current.mcpCustomInstructions)) return; const next = { ...current.mcpCustomInstructions }; delete next[name]; this.persist({ ...current, mcpCustomInstructions: next }); }
-  getNotificationConfig() { const current = this.load(); if (current.notifications?.isEnabled !== false || Object.keys(current.notifications).length !== 1) this.persist({ ...current, notifications: { isEnabled: false } }); return SAND_DISABLED_NOTIFICATION_CONFIG; }
+  deleteMcpCustomInstruction(name: string): void { this.update((current) => { if (!(name in current.mcpCustomInstructions)) return current; const next = { ...current.mcpCustomInstructions }; delete next[name]; return { ...current, mcpCustomInstructions: next }; }); }
+  // Notifications are off for good in this reconstruction, so the answer is a constant and the
+  // write only normalizes a file that claims otherwise. Neither an unreadable file nor a failed
+  // write may turn a getter into a throw.
+  getNotificationConfig() { try { this.update((current) => current.notifications?.isEnabled === false && Object.keys(current.notifications).length === 1 ? current : { ...current, notifications: { isEnabled: false } }); } catch {} return SAND_DISABLED_NOTIFICATION_CONFIG; }
   setNotificationConfig(_input: unknown): void { this.update((s) => ({ ...s, notifications: { isEnabled: false } })); }
   getAutoReviewInstructions(): SandAutoReviewInstructions { return this.load().autoReviewInstructions ?? DEFAULT_SAND_AUTO_REVIEW_INSTRUCTIONS; }
   setAutoReviewInstructions(value: SandAutoReviewInstructions): void { const normalized = normalizeSandAutoReviewInstructions(value); this.update((s) => { const { autoReviewInstructions: _old, ...rest } = s; return normalized.isEnabled && normalized.allowInstructions.length === 0 && normalized.blockInstructions.length === 0 ? rest : { ...rest, autoReviewInstructions: normalized }; }); }
