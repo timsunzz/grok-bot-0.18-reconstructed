@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 type Tool = {
   readonly name: string;
@@ -36,24 +36,31 @@ function mcpResult(value: unknown): Record<string, unknown> {
   return { isError: success?.isError === true, content: content.length === 0 ? [{ type: "text", text: JSON.stringify(success ?? value) }] : content, ...(success?.structuredContent == null ? {} : { structuredContent: success.structuredContent }) };
 }
 
+const MAX_BODY_BYTES = 1_048_576;
+
 export async function createRoutedMcpBridge(deps: {
   readonly listTools: () => Promise<unknown>;
   readonly callTool: (args: Tool & { readonly args: unknown; readonly toolCallId: string }) => Promise<unknown>;
 }): Promise<{ readonly url: string; close(): Promise<void> }> {
   const secret = randomUUID();
   let tools = new Map<string, Tool>();
-  const server = createServer(async (request, response) => {
+  const serve = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     if (request.method !== "POST" || request.url !== `/mcp/${secret}`) { response.writeHead(404).end(); return; }
     let body = "";
     for await (const chunk of request) {
       body += String(chunk);
-      if (body.length > 1_048_576) { response.writeHead(413).end(); return; }
+      // Stop the upload as well as refusing it; otherwise the sender keeps filling a socket whose
+      // request nobody is reading any more.
+      if (body.length > MAX_BODY_BYTES) { response.writeHead(413).end(); request.destroy(); return; }
     }
     let message: Record<string, any>;
     try { message = JSON.parse(body) as Record<string, any>; }
     catch { response.writeHead(400).end(); return; }
     if (message.method === "notifications/initialized") { response.writeHead(202).end(); return; }
-    const reply = (result: unknown) => { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result })); };
+    // A handler that both replies and then fails would otherwise write after end, which throws
+    // over whatever the original failure was.
+    let replied = false;
+    const reply = (result: unknown) => { if (replied) return; replied = true; response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result })); };
     try {
       if (message.method === "initialize") { reply({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "grok-bot-plugins", version: "1" } }); return; }
       if (message.method === "tools/list") {
@@ -80,6 +87,15 @@ export async function createRoutedMcpBridge(deps: {
     } catch (error) {
       reply({ isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] });
     }
+  };
+  const server = createServer((request, response) => {
+    // A client that disconnects mid-upload rejects the request iterator, and the coordinator exits
+    // on `unhandledRejection`, so one abandoned tool call used to take the whole process down.
+    // Whatever went wrong, this connection is the only casualty.
+    void serve(request, response).catch(() => {
+      if (response.writableEnded) return;
+      try { response.writeHead(500).end(); } catch { response.destroy(); }
+    });
   });
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   const address = server.address();
