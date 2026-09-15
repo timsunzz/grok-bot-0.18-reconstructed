@@ -49,6 +49,16 @@ export function projectInferenceRouterTranscriptEntry(entry: StoredEntry): Recor
     : { kind: "send-message", id: entry.id, message: { type: "text", content: entry.content }, timestampMs: entry.timestampMs, ...(entry.reactions === undefined ? {} : { reactions: entry.reactions }) };
 }
 
+export function mergeInferenceRouterTranscriptEntries(remote: readonly unknown[], local: readonly unknown[]): unknown[] {
+  const seenIds = new Set<string>(), reversed: unknown[] = [], merged = [...remote, ...local];
+  for (let index = merged.length - 1; index >= 0; index -= 1) {
+    const entry = merged[index], id = asRecord(entry)?.id;
+    if (typeof id === "string" && id.length > 0) { if (seenIds.has(id)) continue; seenIds.add(id); }
+    reversed.push(entry);
+  }
+  return reversed.reverse();
+}
+
 export function createCoordinatorInferenceRouter(options: {
   readonly dataDir: string;
   readonly postEvent: (family: string, payload: unknown) => void;
@@ -205,7 +215,7 @@ export function createCoordinatorInferenceRouter(options: {
         const [remote, local] = await Promise.all([options.dispatchRemote(method, args), load()]);
         const result = asRecord(remote);
         if (result == null || !Array.isArray(result.entries) || agentId.length === 0) return { handled: true, value: remote };
-        const entries = [...result.entries, ...(local.agents[agentId] ?? []).map(projectInferenceRouterTranscriptEntry)];
+        const entries = mergeInferenceRouterTranscriptEntries(result.entries, (local.agents[agentId] ?? []).map(projectInferenceRouterTranscriptEntry));
         const limit = typeof record.limit === "number" && Number.isInteger(record.limit) && record.limit > 0 ? record.limit : 500;
         return { handled: true, value: { ...result, entries: entries.slice(-limit) } };
       }

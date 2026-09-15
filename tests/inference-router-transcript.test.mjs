@@ -73,3 +73,22 @@ test("routed transcript rejects malformed rich text carriers", async () => {
     await loaded.dispose();
   }
 });
+
+test("routed transcript merge keeps the local version of duplicate entries", async () => {
+  const loaded = await loadModule();
+  try {
+    const remoteOnly = { id: "t1u", content: "remote" };
+    const duplicateRemote = { id: "t2s0", content: "stale remote" };
+    const duplicateLocal = { id: "t2s0", content: "authoritative local" };
+    const withoutId = { content: "status row" };
+    assert.deepEqual(
+      loaded.module.mergeInferenceRouterTranscriptEntries(
+        [remoteOnly, duplicateRemote, withoutId],
+        [duplicateLocal],
+      ),
+      [remoteOnly, withoutId, duplicateLocal],
+    );
+  } finally {
+    await loaded.dispose();
+  }
+});

@@ -1,6 +1,7 @@
 /** Mechanically recovered from the immutable 0.18 host bundle. */
 type GatewayApi = any;
-export function parseCommandArgs(body: string): unknown { return body.length > 0 ? JSON.parse(body) : {}; }
+export class SandGatewayRequestError extends Error { constructor(message: string) { super(message); this.name = "SandGatewayRequestError"; } }
+export function parseCommandArgs(body: string): unknown { if (body.length === 0) return {}; try { return JSON.parse(body); } catch { throw new SandGatewayRequestError("Request body must be valid JSON."); } }
 export const SAND_GATEWAY_COMMANDS = {
   getTranscript: (api: GatewayApi) => api.getTranscript(),
   getAgentTranscript: (api: GatewayApi, body: string) => api.getAgentTranscript(parseCommandArgs(body)),
