@@ -92,20 +92,84 @@ test("a failed routed turn keeps the transcript's turn numbering intact", { time
   }
 });
 
-test("a resubmitted prompt does not run the turn twice", { timeout: 90_000 }, async () => {
+async function seedTranscript(dataDir, agentId, entries) {
+  await writeFile(
+    path.join(dataDir, "inference-router-transcript.json"),
+    JSON.stringify({ schemaVersion: 2, agents: { [agentId]: entries.map((entry) => ({ provider: "openrouter", timestampMs: 1_000, ...entry })) } }, null, 2),
+  );
+}
+
+test("a prompt that was already answered is not run again", { timeout: 90_000 }, async () => {
   const loaded = await loadRouter();
   try {
     await seedProvider(loaded.dataDir, "openrouter");
+    await seedTranscript(loaded.dataDir, "agent-2", [
+      { role: "user", content: "only once", id: "t0u", clientNonce: "repeat" },
+      { role: "assistant", content: "answered once", id: "t0s0" },
+    ]);
     const { router } = harness(loaded.dataDir, loaded.module);
 
-    await router.dispatch("sendPrompt", { agentId: "agent-2", prompt: "only once", clientNonce: "repeat" });
-    await waitForAssistant(loaded.dataDir, "agent-2", 1);
+    // A resubmission carries the nonce of the submission it repeats, which is how the desktop
+    // recovers from a dropped acknowledgement. Running it again would duplicate the turn.
     await router.dispatch("sendPrompt", { agentId: "agent-2", prompt: "only once", clientNonce: "repeat" });
 
-    // Give the second dispatch the same budget the first one needed before concluding it ran.
+    // Give the dispatch the budget a real turn needs before concluding it did not run.
     await new Promise((resolve) => setTimeout(resolve, 3_000));
-    const entries = await storedEntries(loaded.dataDir, "agent-2");
+    assert.deepEqual((await storedEntries(loaded.dataDir, "agent-2")).map((entry) => entry.id), ["t0u", "t0s0"]);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("a prompt whose turn failed can be sent again under the same nonce", { timeout: 90_000 }, async () => {
+  const loaded = await loadRouter();
+  try {
+    await seedProvider(loaded.dataDir, "openrouter");
+    await seedTranscript(loaded.dataDir, "agent-4", [
+      { role: "user", content: "try again", id: "t0u", clientNonce: "resend" },
+      { role: "assistant", content: "[reason: provider_rate_limit] Router error: rate limit exceeded", id: "t0s0", failureReason: "provider_rate_limit" },
+    ]);
+    const { router } = harness(loaded.dataDir, loaded.module);
+
+    // Resending a failed turn is what the desktop's `resendFailed` does, and it reuses the nonce.
+    // Deduplicating on the prompt alone refused to run it and said nothing about why, so the
+    // person's only recovery was to retype the message.
+    await router.dispatch("sendPrompt", { agentId: "agent-4", prompt: "try again", clientNonce: "resend" });
+    const entries = await waitForAssistant(loaded.dataDir, "agent-4", 2);
+
+    assert.deepEqual(entries.map((entry) => entry.id), ["t0u", "t0s0", "t1u", "t1s0"]);
+    assert.equal(entries[3].failureReason, "missing_credential");
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("a turn that fails before reaching the provider still answers its own prompt", { timeout: 90_000 }, async () => {
+  const loaded = await loadRouter();
+  try {
+    await seedProvider(loaded.dataDir, "openrouter");
+    const events = [];
+    const router = loaded.module.createCoordinatorInferenceRouter({
+      dataDir: loaded.dataDir,
+      postEvent: (family, payload) => events.push({ family, payload }),
+      // Listing the plugin tools happens after the prompt is recorded, so its failure is reported
+      // by the queue rather than by the turn itself.
+      dispatchRemote: async (method) => {
+        if (method === "getAgentTranscriptTail") return { entries: [] };
+        if (method === "listRoutedMcpTools") throw new Error("the plugin host is not running");
+        if (method === "listAgents") return [];
+        return null;
+      },
+      now: () => 1_000,
+    });
+
+    await router.dispatch("sendPrompt", { agentId: "agent-5", prompt: "hello", clientNonce: "nonce-5" });
+    const entries = await waitForAssistant(loaded.dataDir, "agent-5", 1);
+
+    // The reply used to be filed at the next turn, one ahead of the prompt it was answering,
+    // leaving that prompt looking permanently unanswered.
     assert.deepEqual(entries.map((entry) => entry.id), ["t0u", "t0s0"]);
+    assert.match(entries[1].content, /the plugin host is not running/);
   } finally {
     await loaded.dispose();
   }

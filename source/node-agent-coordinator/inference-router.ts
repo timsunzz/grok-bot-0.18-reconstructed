@@ -6,7 +6,7 @@ import { runRoutedProviderText } from "../host/extensions/inference/provider-ses
 import type { SandInferenceProvider } from "../shared/inference-router.js";
 import { SandSettingsStore } from "../shared/node/settings/sand-settings-store.js";
 import { routedToolCallFailed, routedToolIsReadOnly } from "../shared/routed-tool-effects.js";
-import { classifyRoutedTurnFailure, formatRoutedTurnFailure, routedTurnRetryDelayMs, routedTurnRetryPolicy } from "../shared/routed-turn-failure.js";
+import { classifyRoutedTurnFailure, formatRoutedTurnFailure, isRoutedTurnFailureReason, routedTurnRetryDelayMs, routedTurnRetryPolicy, type RoutedTurnFailureReason } from "../shared/routed-turn-failure.js";
 import { createRoutedMcpBridge } from "./routed-mcp-bridge.js";
 import { createRoutedToolBreaker } from "./routed-tool-breaker.js";
 
@@ -20,6 +20,10 @@ type StoredEntry = {
   readonly id: string;
   readonly clientNonce?: string;
   readonly reactions?: readonly { readonly emoji: string; readonly by: string }[];
+  // Present only on a reply that is a failure, and then it is the classification. It is what makes
+  // "this prompt was answered" answerable — the alternative is reading the sentence — and a
+  // surface can branch on it without parsing prose.
+  readonly failureReason?: RoutedTurnFailureReason;
   readonly timestampMs: number;
 };
 type Store = { readonly schemaVersion: 2; readonly agents: Readonly<Record<string, readonly StoredEntry[]>> };
@@ -41,6 +45,7 @@ export function parseInferenceRouterTranscriptStore(value: unknown): Store {
       const row = asRecord(raw);
       if (row == null || !["codex", "claude-code", "openrouter"].includes(String(row.provider)) || !["user", "assistant"].includes(String(row.role)) || typeof row.content !== "string" || typeof row.id !== "string" || typeof row.timestampMs !== "number" || (row.clientNonce !== undefined && typeof row.clientNonce !== "string") || (row.richText !== undefined && typeof row.richText !== "string")) continue;
       if (row.reactions !== undefined && (!Array.isArray(row.reactions) || row.reactions.some(reaction => asRecord(reaction) == null || typeof asRecord(reaction)!.emoji !== "string" || typeof asRecord(reaction)!.by !== "string"))) continue;
+      if (row.failureReason !== undefined && !isRoutedTurnFailureReason(row.failureReason)) continue;
       entries.push(row as unknown as StoredEntry);
     }
     agents[agentId] = entries.slice(-200);
@@ -51,7 +56,7 @@ export function parseInferenceRouterTranscriptStore(value: unknown): Store {
 export function projectInferenceRouterTranscriptEntry(entry: StoredEntry): Record<string, unknown> {
   return entry.role === "user"
     ? { kind: "message", id: entry.id, role: "user", content: entry.content, ...(entry.richText === undefined ? {} : { richText: entry.richText }), isStreaming: false, timestampMs: entry.timestampMs, ...(entry.clientNonce === undefined ? {} : { clientNonce: entry.clientNonce }), ...(entry.reactions === undefined ? {} : { reactions: entry.reactions }) }
-    : { kind: "send-message", id: entry.id, message: { type: "text", content: entry.content }, timestampMs: entry.timestampMs, ...(entry.reactions === undefined ? {} : { reactions: entry.reactions }) };
+    : { kind: "send-message", id: entry.id, message: { type: "text", content: entry.content }, timestampMs: entry.timestampMs, ...(entry.reactions === undefined ? {} : { reactions: entry.reactions }), ...(entry.failureReason === undefined ? {} : { failureReason: entry.failureReason }) };
 }
 
 export function createCoordinatorInferenceRouter(options: {
@@ -98,6 +103,19 @@ export function createCoordinatorInferenceRouter(options: {
     const remoteIds = remoteEntries.flatMap(raw => { const id = asRecord(raw)?.id; return typeof id === "string" ? [id] : []; });
     const turn = Math.max(highestTurn(remoteIds), highestTurn((store.agents[agentId] ?? []).map(entry => entry.id))) + 1;
     return { turn, store };
+  };
+  // The turn of the newest prompt that has no reply, so a failure reported from outside `execute`
+  // can be filed against the prompt it belongs to. Without this the reply lands a turn ahead of
+  // its prompt whenever the prompt was already appended, which is every failure between appending
+  // the prompt and starting the provider request.
+  const unansweredTurn = async (agentId: string, fallbackTurn: number): Promise<number> => {
+    const entries = (await load().catch(() => EMPTY_STORE)).agents[agentId] ?? [];
+    const answered = new Set(entries.flatMap(entry => entry.role === "assistant" ? [TURN_ID_PATTERN.exec(entry.id)?.[1] ?? ""] : []));
+    const pending = entries.flatMap(entry => {
+      const turn = entry.role === "user" ? TURN_ID_PATTERN.exec(entry.id)?.[1] : undefined;
+      return turn != null && !answered.has(turn) ? [Number(turn)] : [];
+    });
+    return pending.length === 0 ? fallbackTurn : Math.max(...pending);
   };
   const beginActivity = async (agentId: string): Promise<() => void> => {
     try {
@@ -149,12 +167,21 @@ export function createCoordinatorInferenceRouter(options: {
     const timestampMs = now();
     const { turn, store: beforeUser } = await nextTurn(agentId);
     // A resubmitted prompt carries the nonce of the submission it repeats. Replaying it would
-    // duplicate the turn, so an identical (nonce, prompt) pair is acknowledged without running
-    // again. A reused nonce carrying different text still runs: dropping a real message would
-    // be worse than an extra turn.
-    if ((beforeUser.agents[agentId] ?? []).some(entry => entry.clientNonce === clientNonce && entry.content === prompt)) {
-      return { accepted: true, clientNonce, provider, deduplicated: true };
-    }
+    // duplicate the turn, so a prompt that was already answered under this nonce is acknowledged
+    // without running again. A reused nonce carrying different text still runs: dropping a real
+    // message would be worse than an extra turn.
+    //
+    // "Answered" is the part that matters. A prompt whose turn failed is recorded too, and
+    // resending it is how a person retries — the desktop's `resendFailed` reuses the nonce — so a
+    // guard that only looked for the prompt refused to run the turn a second time and said nothing
+    // about why.
+    const existing = beforeUser.agents[agentId] ?? [];
+    const repeated = existing.filter(entry => entry.role === "user" && entry.clientNonce === clientNonce && entry.content === prompt);
+    const answered = repeated.some(entry => {
+      const repeatedTurn = TURN_ID_PATTERN.exec(entry.id)?.[1];
+      return repeatedTurn != null && existing.some(reply => reply.role === "assistant" && reply.id === `t${repeatedTurn}s0` && reply.failureReason === undefined);
+    });
+    if (answered) return { accepted: true, clientNonce, provider };
     const userEntry = { kind: "message", id: `t${turn}u`, role: "user", content: prompt, ...(richText === undefined ? {} : { richText }), isStreaming: false, timestampMs, clientNonce };
     const withUser = await append(agentId, [{ provider, role: "user", content: prompt, ...(richText === undefined ? {} : { richText }), id: userEntry.id, clientNonce, timestampMs }]);
     emitTranscript(agentId, "appended", userEntry);
@@ -172,8 +199,8 @@ export function createCoordinatorInferenceRouter(options: {
     const assistantTimestampMs = now();
     const assistantId = `t${turn}s0`;
     let assistantStreamStarted = false;
-    const emitAssistant = (nextContent: string, streaming: boolean) => {
-      const entry = { kind: "send-message", id: assistantId, message: { type: "text", content: nextContent }, streaming, timestampMs: assistantTimestampMs };
+    const emitAssistant = (nextContent: string, streaming: boolean, failureReason?: RoutedTurnFailureReason) => {
+      const entry = { kind: "send-message", id: assistantId, message: { type: "text", content: nextContent }, streaming, timestampMs: assistantTimestampMs, ...(failureReason === undefined ? {} : { failureReason }) };
       emitTranscript(agentId, assistantStreamStarted ? "updated" : "appended", entry);
       assistantStreamStarted = true;
     };
@@ -232,9 +259,9 @@ export function createCoordinatorInferenceRouter(options: {
       // instead of inventing one.
       const reason = classifyRoutedTurnFailure(error);
       const failure = formatRoutedTurnFailure(error, reason, { appliedWriteEffect });
-      await append(agentId, [{ provider, role: "assistant", content: failure, id: assistantId, timestampMs: assistantTimestampMs }]);
-      emitAssistant(failure, false);
-      return { accepted: true, clientNonce, provider, reason };
+      await append(agentId, [{ provider, role: "assistant", content: failure, id: assistantId, failureReason: reason, timestampMs: assistantTimestampMs }]);
+      emitAssistant(failure, false, reason);
+      return { accepted: true, clientNonce, provider };
     } finally { endActivity(); await bridge?.close(); }
     await append(agentId, [{ provider, role: "assistant", content, id: assistantId, timestampMs: assistantTimestampMs }]);
     emitAssistant(content, false);
@@ -272,15 +299,16 @@ export function createCoordinatorInferenceRouter(options: {
       const previous = queues.get(agentId) ?? Promise.resolve();
       const next = previous.catch(() => undefined).then(() => execute(provider, record)).catch(async (error) => {
         const timestampMs = now();
-        const content = formatRoutedTurnFailure(error);
+        const reason = classifyRoutedTurnFailure(error);
+        const content = formatRoutedTurnFailure(error, reason);
         if (agentId.length === 0) return;
-        // This id used to be `t${Date.now()}s0`, which fed epoch milliseconds into the turn
-        // counter and left every later turn permanently misordered against the remote
-        // transcript.
-        const turn = await nextTurn(agentId).then(result => result.turn).catch(() => 0);
-        const id = `t${turn}s0`;
-        await append(agentId, [{ provider, role: "assistant", content, id, timestampMs }]);
-        emitTranscript(agentId, "appended", { kind: "send-message", id, message: { type: "text", content }, timestampMs });
+        // `execute` can fail after recording the prompt — bringing up the tool bridge, listing
+        // tools, a store write — and then the reply belongs to that prompt's turn, not to the next
+        // one. A turn ahead of its prompt leaves the prompt looking permanently unanswered.
+        const fallbackTurn = await nextTurn(agentId).then(result => result.turn).catch(() => 0);
+        const id = `t${await unansweredTurn(agentId, fallbackTurn)}s0`;
+        await append(agentId, [{ provider, role: "assistant", content, id, failureReason: reason, timestampMs }]);
+        emitTranscript(agentId, "appended", { kind: "send-message", id, message: { type: "text", content }, failureReason: reason, timestampMs });
       });
       const queued = next.finally(() => { if (queues.get(agentId) === queued) queues.delete(agentId); });
       queues.set(agentId, queued);
