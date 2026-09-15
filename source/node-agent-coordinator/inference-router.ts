@@ -5,7 +5,11 @@ import { dirname, join } from "node:path";
 import { runRoutedProviderText } from "../host/extensions/inference/provider-session.js";
 import type { SandInferenceProvider } from "../shared/inference-router.js";
 import { SandSettingsStore } from "../shared/node/settings/sand-settings-store.js";
+import { classifyRoutedTurnFailure, formatRoutedTurnFailure, routedTurnRetryPolicy } from "../shared/routed-turn-failure.js";
 import { createRoutedMcpBridge } from "./routed-mcp-bridge.js";
+
+const TURN_ID_PATTERN = /^t(\d+)(?:u|s\d+)$/;
+const RETRY_BACKOFF_MS = 750;
 
 type StoredEntry = {
   readonly provider: Exclude<SandInferenceProvider, "cursor">;
@@ -77,6 +81,23 @@ export function createCoordinatorInferenceRouter(options: {
     return next;
   };
   const emitTranscript = (agentId: string, type: "appended" | "updated", entry: Record<string, unknown>) => options.postEvent("transcript", { type, entry, agentId });
+  const highestTurn = (ids: readonly string[]): number => ids.reduce((highest, id) => {
+    const match = TURN_ID_PATTERN.exec(id);
+    return match?.[1] == null ? highest : Math.max(highest, Number(match[1]));
+  }, -1);
+  // Turn numbers order the local routed transcript against the remote one, so they have to
+  // stay small and monotonic. A failed transcript fetch falls back to local numbering rather
+  // than failing the turn, because the local store already records our own entries.
+  const nextTurn = async (agentId: string): Promise<{ readonly turn: number; readonly store: Store }> => {
+    const [remote, store] = await Promise.all([
+      options.dispatchRemote("getAgentTranscriptTail", { id: agentId }).catch(() => null),
+      load(),
+    ]);
+    const remoteEntries = Array.isArray(asRecord(remote)?.entries) ? asRecord(remote)!.entries as unknown[] : [];
+    const remoteIds = remoteEntries.flatMap(raw => { const id = asRecord(raw)?.id; return typeof id === "string" ? [id] : []; });
+    const turn = Math.max(highestTurn(remoteIds), highestTurn((store.agents[agentId] ?? []).map(entry => entry.id))) + 1;
+    return { turn, store };
+  };
   const beginActivity = async (agentId: string): Promise<() => void> => {
     try {
       const remote = await options.dispatchRemote("listAgents", {});
@@ -125,18 +146,14 @@ export function createCoordinatorInferenceRouter(options: {
     const clientNonce = typeof args.clientNonce === "string" ? args.clientNonce : randomUUID();
     if (agentId.length === 0 || prompt.length === 0) throw new Error("Local inference routing requires an agentId and prompt");
     const timestampMs = now();
-    const [remote, beforeUser] = await Promise.all([options.dispatchRemote("getAgentTranscriptTail", { id: agentId }), load()]);
-    const remoteEntries = Array.isArray(asRecord(remote)?.entries) ? asRecord(remote)!.entries as unknown[] : [];
-    const remoteTurn = remoteEntries.reduce<number>((highest, raw) => {
-      const id = asRecord(raw)?.id;
-      const match = typeof id === "string" ? /^t(\d+)(?:u|s\d+)$/.exec(id) : null;
-      return match == null ? highest : Math.max(highest, Number(match[1]));
-    }, -1);
-    const localTurn = (beforeUser.agents[agentId] ?? []).reduce((highest, entry) => {
-      const match = /^t(\d+)(?:u|s\d+)$/.exec(entry.id);
-      return match == null ? highest : Math.max(highest, Number(match[1]));
-    }, -1);
-    const turn = Math.max(remoteTurn, localTurn) + 1;
+    const { turn, store: beforeUser } = await nextTurn(agentId);
+    // A resubmitted prompt carries the nonce of the submission it repeats. Replaying it would
+    // duplicate the turn, so an identical (nonce, prompt) pair is acknowledged without running
+    // again. A reused nonce carrying different text still runs: dropping a real message would
+    // be worse than an extra turn.
+    if ((beforeUser.agents[agentId] ?? []).some(entry => entry.clientNonce === clientNonce && entry.content === prompt)) {
+      return { accepted: true, clientNonce, provider, deduplicated: true };
+    }
     const userEntry = { kind: "message", id: `t${turn}u`, role: "user", content: prompt, ...(richText === undefined ? {} : { richText }), isStreaming: false, timestampMs, clientNonce };
     const withUser = await append(agentId, [{ provider, role: "user", content: prompt, ...(richText === undefined ? {} : { richText }), id: userEntry.id, clientNonce, timestampMs }]);
     emitTranscript(agentId, "appended", userEntry);
@@ -166,7 +183,7 @@ export function createCoordinatorInferenceRouter(options: {
     const directTools = bridge == null ? await options.dispatchRemote("listRoutedMcpTools", {}) : undefined;
     const tools = Array.isArray(directTools) ? directTools as Record<string, any>[] : undefined;
     const onTextDelta = (_delta: string, accumulated: string) => emitAssistant(accumulated, true);
-    try { content = await runRoutedProviderText(provider, messages, bridge == null ? {
+    const attempt = () => runRoutedProviderText(provider, messages, bridge == null ? {
       ...(tools === undefined ? {} : { tools }),
       executeTool: async (definition, toolArgs, toolCallId) => await options.dispatchRemote("executeRoutedMcpTool", {
         providerIdentifier: definition.providerIdentifier,
@@ -177,8 +194,24 @@ export function createCoordinatorInferenceRouter(options: {
         agentId,
       }),
       onTextDelta,
-    } : { mcpServerUrl: bridge.url, onTextDelta }); }
-    finally { endActivity(); await bridge?.close(); }
+    } : { mcpServerUrl: bridge.url, onTextDelta });
+    try {
+      try { content = await attempt(); }
+      catch (error) {
+        // One retry, and only for classes a retry can actually fix. The same turn resumes;
+        // a retried turn never mints a new one.
+        if (routedTurnRetryPolicy(classifyRoutedTurnFailure(error)) !== "resume") throw error;
+        await new Promise<void>(resolve => setTimeout(resolve, RETRY_BACKOFF_MS));
+        content = await attempt();
+      }
+    } catch (error) {
+      // Reported here rather than by the caller so the failure keeps this turn's own id
+      // instead of inventing one.
+      const failure = formatRoutedTurnFailure(error);
+      await append(agentId, [{ provider, role: "assistant", content: failure, id: assistantId, timestampMs: assistantTimestampMs }]);
+      emitAssistant(failure, false);
+      return { accepted: true, clientNonce, provider, reason: classifyRoutedTurnFailure(error) };
+    } finally { endActivity(); await bridge?.close(); }
     await append(agentId, [{ provider, role: "assistant", content, id: assistantId, timestampMs: assistantTimestampMs }]);
     emitAssistant(content, false);
     return { accepted: true, clientNonce, provider };
@@ -215,12 +248,15 @@ export function createCoordinatorInferenceRouter(options: {
       const previous = queues.get(agentId) ?? Promise.resolve();
       const next = previous.catch(() => undefined).then(() => execute(provider, record)).catch(async (error) => {
         const timestampMs = now();
-        const content = `Router error: ${error instanceof Error ? error.message : String(error)}`;
-        if (agentId.length > 0) {
-          const id = `t${Date.now()}s0`;
-          await append(agentId, [{ provider, role: "assistant", content, id, timestampMs }]);
-          emitTranscript(agentId, "appended", { kind: "send-message", id, message: { type: "text", content }, timestampMs });
-        }
+        const content = formatRoutedTurnFailure(error);
+        if (agentId.length === 0) return;
+        // This id used to be `t${Date.now()}s0`, which fed epoch milliseconds into the turn
+        // counter and left every later turn permanently misordered against the remote
+        // transcript.
+        const turn = await nextTurn(agentId).then(result => result.turn).catch(() => 0);
+        const id = `t${turn}s0`;
+        await append(agentId, [{ provider, role: "assistant", content, id, timestampMs }]);
+        emitTranscript(agentId, "appended", { kind: "send-message", id, message: { type: "text", content }, timestampMs });
       });
       const queued = next.finally(() => { if (queues.get(agentId) === queued) queues.delete(agentId); });
       queues.set(agentId, queued);
