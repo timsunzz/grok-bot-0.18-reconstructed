@@ -121,7 +121,7 @@ function routedTimeoutError(provider: RoutedProvider, idleTimeoutMs: number): Er
   return error;
 }
 
-type RoutedIdleWatchdog = { readonly expired: Promise<never>; bump(): void; stop(): void };
+type RoutedIdleWatchdog = { readonly expired: Promise<never>; bump(): void; awaitingProvider(waiting: boolean): void; stop(): void };
 
 function routedIdleWatchdog(provider: RoutedProvider, runtime: RoutedRuntime): RoutedIdleWatchdog | null {
   const idleTimeoutMs = runtime.idleTimeoutMs ?? 0;
@@ -131,9 +131,12 @@ function routedIdleWatchdog(provider: RoutedProvider, runtime: RoutedRuntime): R
   if (controller == null || !(idleTimeoutMs > 0)) return null;
   const { promise, reject } = Promise.withResolvers<never>();
   promise.catch(() => {});
-  let lastActivityMs = Date.now();
+  // Only time spent waiting on the provider counts. Whatever the consumer does with a part it has
+  // already been handed is its own business, and cancelling a healthy request because the reader
+  // was busy would be a worse bug than the one this fixes.
+  let waitingSinceMs: number | null = null;
   const timer = setInterval(() => {
-    if (Date.now() - lastActivityMs < idleTimeoutMs) return;
+    if (waitingSinceMs == null || Date.now() - waitingSinceMs < idleTimeoutMs) return;
     clearInterval(timer);
     const error = routedTimeoutError(provider, idleTimeoutMs);
     // Aborted so the provider request is closed, and rejected so the caller hears the deadline
@@ -142,7 +145,12 @@ function routedIdleWatchdog(provider: RoutedProvider, runtime: RoutedRuntime): R
     reject(error);
   }, Math.max(250, Math.min(idleTimeoutMs, 5_000)));
   timer.unref();
-  return { expired: promise, bump: () => { lastActivityMs = Date.now(); }, stop: () => clearInterval(timer) };
+  return {
+    expired: promise,
+    bump: () => { if (waitingSinceMs != null) waitingSinceMs = Date.now(); },
+    awaitingProvider: (waiting) => { waitingSinceMs = waiting ? Date.now() : null; },
+    stop: () => clearInterval(timer),
+  };
 }
 
 function whileAnswering<T>(source: AsyncIterable<T>, watchdog: RoutedIdleWatchdog | null): AsyncIterable<T> {
@@ -156,12 +164,11 @@ async function* guarded<T>(source: AsyncIterable<T>, watchdog: RoutedIdleWatchdo
       const step = iterator.next();
       // The abandoned step keeps running until the abort reaches it, with nobody waiting on it.
       step.catch(() => {});
+      watchdog.awaitingProvider(true);
       const result = await Promise.race([step, watchdog.expired]);
+      watchdog.awaitingProvider(false);
       if (result.done === true) return;
-      watchdog.bump();
       yield result.value;
-      // Time the consumer spent on what it was handed is not the provider going quiet.
-      watchdog.bump();
     }
   } finally {
     watchdog.stop();

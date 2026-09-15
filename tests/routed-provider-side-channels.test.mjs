@@ -236,6 +236,38 @@ test("the host's own agent turns get the same deadline", { timeout: 30_000 }, as
   }
 });
 
+test("a reader taking its time is not a provider going quiet", { timeout: 30_000 }, async () => {
+  const loaded = await loadProviderSession();
+  try {
+    // The provider said everything at once; it is the consumer that is slow, and what a consumer
+    // does with a part it has already been handed is its own business. Cancelling a request that
+    // answered in full because the reader was busy would be a worse bug than the one the deadline
+    // fixes.
+    process.env.SAND_ROUTED_IDLE_TIMEOUT_MS = "300";
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(async () => sse([
+      'data: {"type":"response.output_text.delta","delta":"one"}',
+      'data: {"type":"response.output_text.delta","delta":" two"}',
+      'data: {"type":"response.completed","response":{"id":"resp-1","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}',
+      "data: [DONE]",
+    ].map((line) => `${line}\n\n`).join("")), async () => {
+      const session = loaded.module.createProviderPromptSession("codex");
+      const result = session.getExecutor().stream(undefined, "invocation-1");
+      const iterator = result.fullStream[Symbol.asyncIterator]();
+
+      assert.equal((await iterator.next()).value.textDelta, "one");
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      assert.equal((await iterator.next()).value.textDelta, " two");
+      assert.equal((await iterator.next()).done, true);
+      assert.equal((await result.response).messages[0].content[0].text, "one two");
+    }));
+
+    assert.deepEqual(observed, []);
+  } finally {
+    delete process.env.SAND_ROUTED_IDLE_TIMEOUT_MS;
+    await loaded.dispose();
+  }
+});
+
 test("a routed OpenRouter turn issues one provider request per attempt", { timeout: 30_000 }, async () => {
   const loaded = await loadProviderSession();
   process.env.OPENROUTER_API_KEY = "test-key";
