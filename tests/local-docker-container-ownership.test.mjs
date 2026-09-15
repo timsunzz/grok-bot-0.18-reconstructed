@@ -29,6 +29,7 @@ printf '%s\\n' "$*" >> "$FAKE_DOCKER_LOG"
 case " $FAKE_DOCKER_HANG " in
   *" $1 "*) exec sleep 600 ;;
 esac
+if [ -n "$FAKE_DOCKER_STDERR_NOISE" ]; then echo "$FAKE_DOCKER_STDERR_NOISE" >&2; fi
 if [ "$1" = "inspect" ]; then
   if [ -n "$FAKE_DOCKER_INSPECT_ERROR" ]; then echo "$FAKE_DOCKER_INSPECT_ERROR" >&2; exit 1; fi
   if [ -s "$FAKE_DOCKER_INSPECT" ]; then cat "$FAKE_DOCKER_INSPECT"; exit 0; fi
@@ -96,6 +97,7 @@ async function loadConnector(options = {}) {
     dispose: async () => {
       process.env.PATH = previousPath ?? "";
       delete process.env.FAKE_DOCKER_INSPECT_ERROR;
+      delete process.env.FAKE_DOCKER_STDERR_NOISE;
       await rm(temporary, { recursive: true, force: true });
     },
   };
@@ -298,6 +300,27 @@ test("a container already holding this host's token is started as it is", { time
     assert.deepEqual(commands.filter((line) => line.startsWith("start")), ["start grok-bot-local-vm"]);
   } finally {
     await gateway.close();
+    await loaded.dispose();
+  }
+});
+
+test("a docker that writes advice to stderr is still a docker that answered", { timeout: 60_000 }, async () => {
+  const loaded = await loadConnector();
+  try {
+    // `podman-docker` prints this in front of every command, and Docker Desktop has its own
+    // announcements. Reading the inspection out of both streams at once turned that note into
+    // malformed JSON, and an unverifiable container is deliberately never touched — so one benign
+    // line on stderr blocked reset, update, and connect alike, with no in-app way back.
+    process.env.FAKE_DOCKER_STDERR_NOISE = "Emulate Docker CLI using podman. Create /etc/containers/nodocker to quiet msg.";
+    await loaded.setContainer(UNOWNED);
+    const routed = connector(loaded);
+
+    const result = await routed.forceRecreate();
+
+    assert.equal(result.status, "rejected");
+    assert.match(result.reason, /unowned container already has that name/);
+    assert.doesNotMatch(result.reason, /malformed/);
+  } finally {
     await loaded.dispose();
   }
 });

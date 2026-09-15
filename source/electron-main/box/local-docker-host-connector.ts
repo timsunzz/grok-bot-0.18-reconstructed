@@ -14,6 +14,9 @@ export const LOCAL_DOCKER_BOX_IMAGE = "public.ecr.aws/k0i0n2g5/cursorenvironment
 export const LOCAL_DOCKER_BOX_CONTAINER = "grok-bot-local-vm";
 export const LOCAL_DOCKER_GATEWAY_URL = "http://127.0.0.1:1340";
 export const LOCAL_DOCKER_OWNER_LABEL = "com.grok-bot.local-vm=1";
+// Bumped whenever a container's fixed configuration gains something this app now depends on, so
+// containers from an earlier build are replaced for the reason that is actually true — they predate
+// the contract — rather than by whichever individual check the new configuration happens to fail.
 export const LOCAL_DOCKER_SCHEMA_VERSION = "6";
 const READY_TIMEOUT_MS = 180_000;
 const OPTIONAL_CREDENTIAL_TIMEOUT_MS = 3_000;
@@ -34,16 +37,25 @@ export interface LocalDockerStatus {
   readonly detail: string;
 }
 
-interface CommandResult { readonly ok: boolean; readonly output: string }
+/**
+ * `output` is both streams, because Docker splits its diagnosis across them and a person reading a
+ * failure wants all of it. `stdout` is the only part that may be parsed: `podman-docker` prefixes
+ * every command with an emulation notice, Docker Desktop announces upgrades, and folding those into
+ * the JSON of `docker inspect` made a healthy daemon indistinguishable from one answering garbage —
+ * which then blocked every lifecycle path, since an unverifiable container is never touched.
+ */
+interface CommandResult { readonly ok: boolean; readonly output: string; readonly stdout: string }
 interface InferenceCredential { readonly accessToken: string; readonly backendUrl: string; readonly expiresAtMs: number }
 interface LocalHostBundle { readonly path: string; readonly sha256: string; readonly boxExecDaemonPath: string; readonly boxExecDaemonSha256: string }
 
 function runDocker(args: readonly string[], timeoutMs = DOCKER_COMMAND_TIMEOUT_MS): Promise<CommandResult> {
   return new Promise((resolve) => {
     const child = spawn("docker", [...args], { stdio: ["ignore", "pipe", "pipe"] });
-    let output = "";
+    let stdout = "";
+    let stderr = "";
     let settled = false;
-    const append = (chunk: Buffer): void => { output += chunk.toString(); if (output.length > 200_000) output = output.slice(-200_000); };
+    const capped = (text: string): string => text.length > 200_000 ? text.slice(-200_000) : text;
+    const combined = (...extra: string[]): string => [stdout, stderr, ...extra].map((part) => part.trim()).filter((part) => part.length > 0).join("\n");
     const settle = (result: CommandResult): void => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
     // A wedged Docker daemon otherwise leaves this promise pending forever, which hangs the
     // settings IPC call and every coordinator reconnect behind it.
@@ -54,13 +66,15 @@ function runDocker(args: readonly string[], timeoutMs = DOCKER_COMMAND_TIMEOUT_M
       child.stdout?.destroy();
       child.stderr?.destroy();
       child.unref();
-      settle({ ok: false, output: `${output}\ndocker ${args[0] ?? ""} did not respond within ${Math.round(timeoutMs / 1_000)}s.`.trim() });
+      settle({ ok: false, stdout, output: combined(`docker ${args[0] ?? ""} did not respond within ${Math.round(timeoutMs / 1_000)}s.`) });
     }, timeoutMs);
     timer.unref();
-    child.stdout?.on("data", append);
-    child.stderr?.on("data", append);
-    child.once("error", (error) => settle({ ok: false, output: `${output}\n${error.message}`.trim() }));
-    child.once("close", (code) => settle({ ok: code === 0, output: output.trim() }));
+    child.stdout?.on("data", (chunk: Buffer) => { stdout = capped(stdout + chunk.toString()); });
+    child.stderr?.on("data", (chunk: Buffer) => { stderr = capped(stderr + chunk.toString()); });
+    // A missing binary arrives here as `spawn docker ENOENT`, which tells the person nothing they
+    // can act on.
+    child.once("error", (error) => settle({ ok: false, stdout, output: combined((error as { code?: unknown }).code === "ENOENT" ? "Docker is not installed, or is not on this app's PATH." : error.message) }));
+    child.once("close", (code) => settle({ ok: code === 0, stdout, output: combined() }));
   });
 }
 
@@ -207,7 +221,7 @@ async function inspectContainer(timeoutMs?: number): Promise<ContainerState> {
       : { kind: "unknown", detail: result.output || `Docker could not inspect ${LOCAL_DOCKER_BOX_CONTAINER}.` };
   }
   try {
-    const value = JSON.parse(result.output) as { State?: { Running?: unknown }; Config?: { Image?: unknown; Labels?: Record<string, unknown> } };
+    const value = JSON.parse(result.stdout) as { State?: { Running?: unknown }; Config?: { Image?: unknown; Labels?: Record<string, unknown> } };
     const labels = value.Config?.Labels ?? {};
     const label = (name: string): string => typeof labels[name] === "string" ? labels[name] as string : "";
     return {
