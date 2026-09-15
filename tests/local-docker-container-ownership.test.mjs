@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -111,6 +111,71 @@ test("an owned container is still replaced on reset", async () => {
     await assert.rejects(routed.forceRecreate(), /reconstructed runtime is unavailable/);
     assert.deepEqual((await loaded.commands()).filter((line) => line.startsWith("rm")), ["rm --force grok-bot-local-vm"]);
   } finally {
+    await loaded.dispose();
+  }
+});
+
+// Stands in for the box's gateway on the address the connector probes, recording the bearer token
+// each health check presents.
+async function recordingGateway() {
+  const { createServer } = await import("node:http");
+  const seen = [];
+  const server = createServer((request, response) => {
+    seen.push(String(request.headers.authorization ?? "").replace(/^Bearer /, ""));
+    response.writeHead(200).end("ok");
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(1340, "127.0.0.1", resolve);
+  });
+  return { seen, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+async function tokenOnDisk(settingsPath) {
+  const stored = JSON.parse(await readFile(path.join(path.dirname(settingsPath), "local-docker-vm.json"), "utf8"));
+  return stored.token;
+}
+
+test("concurrent callers settle on one gateway token", { timeout: 60_000 }, async () => {
+  const loaded = await loadConnector();
+  const gateway = await recordingGateway();
+  try {
+    await loaded.setContainer(OWNED);
+
+    // The settings page and every coordinator reconnect both reach the token, and each caller that
+    // found no file used to mint its own and overwrite the others. The container was then launched
+    // with one token while the health probe used another, so the box never reported ready.
+    const statuses = await Promise.all(Array.from({ length: 8 }, () => loaded.module.getLocalDockerStatus(loaded.settingsPath)));
+
+    assert.deepEqual([...new Set(statuses.map((status) => status.ready))], [true]);
+    assert.equal(gateway.seen.length, 8);
+    assert.deepEqual([...new Set(gateway.seen)], [await tokenOnDisk(loaded.settingsPath)]);
+
+    const stateDir = path.dirname(loaded.settingsPath);
+    assert.deepEqual((await readdir(stateDir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await gateway.close();
+    await loaded.dispose();
+  }
+});
+
+test("an unreadable gateway token is repaired rather than adopted", { timeout: 60_000 }, async () => {
+  const loaded = await loadConnector();
+  const gateway = await recordingGateway();
+  try {
+    await loaded.setContainer(OWNED);
+    const credential = path.join(path.dirname(loaded.settingsPath), "local-docker-vm.json");
+    await mkdir(path.dirname(credential), { recursive: true });
+    await writeFile(credential, '{"schemaVersion":1,"token":"too-short"}');
+
+    const status = await loaded.module.getLocalDockerStatus(loaded.settingsPath);
+
+    assert.equal(status.ready, true);
+    const repaired = await tokenOnDisk(loaded.settingsPath);
+    assert.ok(repaired.length >= 32, `expected a full-length token, got ${repaired}`);
+    assert.deepEqual(gateway.seen, [repaired]);
+  } finally {
+    await gateway.close();
     await loaded.dispose();
   }
 });

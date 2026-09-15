@@ -1,6 +1,6 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -69,27 +69,72 @@ function inferenceCredentialPath(settingsPath: string): string {
   return join(dirname(settingsPath), "local-docker-credential", "inference.json");
 }
 
+async function replaceFileAtomically(target: string, body: string): Promise<void> {
+  // A pid alone is not unique here: this data root is bind-mounted into the box, so the host and
+  // a process inside the container can share one.
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  await mkdir(dirname(target), { recursive: true });
+  try {
+    await writeFile(temporary, body, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, target);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  }
+  await chmod(target, 0o600);
+}
+
 async function persistInferenceCredential(settingsPath: string, credential: InferenceCredential): Promise<string> {
   const target = inferenceCredentialPath(settingsPath);
-  const temporary = `${target}.${process.pid}.tmp`;
-  await mkdir(dirname(target), { recursive: true });
-  await writeFile(temporary, `${JSON.stringify({ accessToken: credential.accessToken, expiresAtMs: credential.expiresAtMs })}\n`, { encoding: "utf8", mode: 0o600 });
-  await rename(temporary, target);
-  await chmod(target, 0o600);
+  await replaceFileAtomically(target, `${JSON.stringify({ accessToken: credential.accessToken, expiresAtMs: credential.expiresAtMs })}\n`);
   return target;
 }
 
-async function readOrCreateToken(settingsPath: string): Promise<string> {
-  const target = credentialPath(settingsPath);
+function tokenBody(token: string): string {
+  return `${JSON.stringify({ schemaVersion: 1, token }, null, 2)}\n`;
+}
+
+async function readToken(target: string): Promise<string | null> {
   try {
     const parsed = JSON.parse(await readFile(target, "utf8")) as { token?: unknown };
-    if (typeof parsed.token === "string" && parsed.token.length >= 32) return parsed.token;
-  } catch {}
+    return typeof parsed.token === "string" && parsed.token.length >= 32 ? parsed.token : null;
+  } catch { return null; }
+}
+
+/**
+ * This token authenticates every request to the box's gateway, so no two callers may settle on
+ * different values. Both `getLocalDockerStatus` behind the settings page and `ensureLocalDockerBox`
+ * behind a coordinator reconnect reach here, and the write used to be unconditional: each caller
+ * that found no file minted its own token and overwrote the other's, so the container was launched
+ * with one token while the health probe used another and the box never reported ready. A torn read
+ * of a non-atomic write had the same effect against an already-running container.
+ *
+ * Creating with `wx` (O_CREAT|O_EXCL) lets exactly one writer win, across processes as well as
+ * within one; every other caller adopts the winner's token by reading it back.
+ */
+async function readOrCreateToken(settingsPath: string): Promise<string> {
+  const target = credentialPath(settingsPath);
+  const existing = await readToken(target);
+  if (existing != null) return existing;
+
   const token = randomBytes(32).toString("hex");
   await mkdir(dirname(target), { recursive: true });
-  await writeFile(target, `${JSON.stringify({ schemaVersion: 1, token }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  await chmod(target, 0o600);
-  return token;
+  try {
+    await writeFile(target, tokenBody(token), { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await chmod(target, 0o600);
+    return token;
+  } catch (error) {
+    if ((error as { code?: unknown }).code !== "EEXIST") throw error;
+  }
+
+  const adopted = await readToken(target);
+  if (adopted != null) return adopted;
+
+  // The file is present but unreadable, so it has to be replaced rather than adopted. Whatever
+  // survives the replace is what the gateway will accept, even if another repair lands after it.
+  const repaired = randomBytes(32).toString("hex");
+  await replaceFileAtomically(target, tokenBody(repaired));
+  return await readToken(target) ?? repaired;
 }
 
 async function gatewayReady(token: string): Promise<boolean> {
