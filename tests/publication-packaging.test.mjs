@@ -52,6 +52,8 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(rendererPatch, /desktop\.agent\.getInferenceRouter\(\)/);
   assert.match(rendererPatch, /desktop\.agent\.setInferenceRouter\(n\)/);
   assert.match(rendererPatch, /desktop\.agent\.getBoxRuntime\(\)/);
+  assert.match(rendererPatch, /desktop\.agent\.getBotRoster\(\)/);
+  assert.match(rendererPatch, /id:"bots",label:"Bots"/);
   assert.match(rendererPatch, /desktop\.agent\.setBoxRuntime\(r\)/);
   assert.match(rendererPatch, /role:"switch"/);
   assert.match(rendererPatch, /Use local Docker VM/);
@@ -66,8 +68,10 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(rendererPatch, /RRouterProviders\.filter/);
   assert.match(preload, /getInferenceRouter: \(\) => edge\("getInferenceRouter"\)/);
   assert.match(preload, /getBoxRuntime: \(\) => edge\("getBoxRuntime"\)/);
+  assert.match(preload, /getBotRoster: \(\) => edge\("getBotRoster"\)/);
+  assert.match(preload, /upsertBot: \(bot: unknown\) => edge\("upsertBot", bot\)/);
   assert.match(preload, /setBoxRuntime: \(mode: string\) => edge\("setBoxRuntime", \{ mode \}\)/);
-  assert.match(mainEdge, /syncHostSettingsToBox\(\{ inferenceProvider: provider \}\)/);
+  assert.match(mainEdge, /syncHostSettingsToBox\(\{ inferenceProvider: provider, botRoster: roster \}\)/);
   assert.match(mainEdge, /invoke\(deps\.settingsStore, "setInferenceProvider", provider\)/);
   assert.match(mainEdge, /return \{ provider, usage:/);
   assert.match(mainEdge, /invoke\(deps\.boxRecovery, "restartCoordinator"\)/);
@@ -96,6 +100,7 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(providers, /queryClaude/);
   assert.match(providers, /tools: mcpServerUrl == null \? \[\] : \["mcp__grok_bot_plugins__\*"\]/);
   assert.match(providers, /https:\/\/openrouter\.ai\/api\/v1/);
+  assert.match(providers, /github.com\/timsunzz\/grok-bot-0.18-reconstructed/);
   assert.match(providers, /OpenRouter needs OPENROUTER_API_KEY/);
   assert.match(cursorSession, /routedProvider !== "cursor"/);
   assert.match(cursorSession, /createProviderPromptSession\(routedProvider\)/);
@@ -105,7 +110,10 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(turnShell, /inferenceProvider === "cursor"/);
   assert.match(turnShell, /createProviderPromptSession\(inferenceProvider\)/);
   assert.match(coordinator, /method !== "sendPrompt" \|\| provider === "cursor"/);
-  assert.match(coordinator, /executeTool: async \(definition, toolArgs, toolCallId\)/);
+  assert.match(coordinator, /const executeTool = async \(definition/);
+  assert.match(coordinator, /MESSAGE_AGENT_TOOL/);
+  assert.match(coordinator, /highestTranscriptTurn/);
+  assert.match(coordinator, /clientNonce === clientNonce/);
   assert.match(coordinatorMain, /command\(commands, "listRoutedMcpTools", args\)/);
   assert.match(coordinator, /inference-router-transcript\.json/);
   assert.match(mcpBridge, /openWorldHint: !readOnly/);
@@ -114,7 +122,9 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(coordinator, /\.map\(projectInferenceRouterTranscriptEntry\)/);
   assert.match(coordinator, /readonly richText\?: string/);
   assert.match(coordinator, /richText: entry\.richText/);
-  assert.match(coordinator, /setTimeout\(resolve, 1_200\)/);
+  assert.match(coordinator, /ROUTER_COMPOSE_DELAY_MS = 1_200/);
+  assert.match(coordinator, /setTimeout\(resolve, composeDelayMs\(\)\)/);
+  assert.match(mainEdge, /syncHostSettingsToBox\(\{ botRoster: next \}\)/);
   assert.match(coordinator, /method === "reactToMessage"/);
   assert.match(coordinator, /reaction\.by === "me"/);
   assert.match(coordinator, /currentActivity: \{ kind: "thinking" \}/);

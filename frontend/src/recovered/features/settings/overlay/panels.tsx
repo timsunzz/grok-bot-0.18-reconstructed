@@ -13,6 +13,7 @@ import { SandSelect } from "../../../ui/sand-floating-primitives";
 import { SandSwitch } from "../../../ui/sand-form-primitives";
 import { OverlayDialog } from "../../../ui/overlay-primitives";
 import { ROUTER_PROVIDERS, routerProviderById, type RouterProviderId } from "./router";
+import type { SettingsBot, SettingsBotRoster } from "./bots";
 
 export type AccountState =
   | { kind: "logged-out"; errorMessage?: string }
@@ -647,6 +648,96 @@ function EgressTunnelSettingsGroup({ available, description, enabled, onChange }
         />
       </div>
     </SettingsGroup>
+  );
+}
+
+export interface BotsSettingsPanelProps {
+  roster: SettingsBotRoster;
+  pending?: boolean;
+  onCreate(bot: { name: string; title: string; description: string; provider: RouterProviderId | null }): void | Promise<unknown>;
+  onHide(botId: string, hidden: boolean): void | Promise<unknown>;
+  onDelete(botId: string): void | Promise<unknown>;
+}
+
+export function BotsSettingsPanel({ roster, pending = false, onCreate, onHide, onDelete }: BotsSettingsPanelProps) {
+  const [name, setName] = useState("");
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [provider, setProvider] = useState<RouterProviderId | "inherit">("inherit");
+  const visible = roster.bots.filter((bot) => !bot.hidden);
+  const hidden = roster.bots.filter((bot) => bot.hidden);
+  return (
+    <div className="sand-bots-section">
+      <SettingsGroup title="Specialist bots">
+        <p className="sand-settings-copy">
+          Named bots keep their own title, standing instructions, and optional provider pin.
+          They can @mention each other and hand work off with <code>message_agent</code>, like Hermes Bot Mode profiles.
+        </p>
+        {visible.length === 0 ? <p className="sand-settings-copy">No bots yet. Create a specialist below.</p> : visible.map((bot) => (
+          <BotRow key={bot.id} bot={bot} disabled={pending} onHide={() => void onHide(bot.id, true)} onDelete={() => void onDelete(bot.id)} />
+        ))}
+      </SettingsGroup>
+      {hidden.length > 0 ? (
+        <SettingsGroup title="Hidden">
+          {hidden.map((bot) => (
+            <BotRow key={bot.id} bot={bot} disabled={pending} onHide={() => void onHide(bot.id, false)} onDelete={() => void onDelete(bot.id)} />
+          ))}
+        </SettingsGroup>
+      ) : null}
+      <SettingsGroup title="New bot">
+        <label className="sand-settings-row">
+          <span className="sand-settings-copy"><strong>Name</strong></span>
+          <input aria-label="Bot name" disabled={pending} onChange={(event) => setName(event.currentTarget.value)} value={name} />
+        </label>
+        <label className="sand-settings-row">
+          <span className="sand-settings-copy"><strong>Title</strong></span>
+          <input aria-label="Bot title" disabled={pending} onChange={(event) => setTitle(event.currentTarget.value)} value={title} />
+        </label>
+        <label className="sand-settings-row">
+          <span className="sand-settings-copy"><strong>Standing instructions</strong></span>
+          <textarea aria-label="Bot standing instructions" disabled={pending} onChange={(event) => setDescription(event.currentTarget.value)} value={description} />
+        </label>
+        <label className="sand-settings-row">
+          <span className="sand-settings-copy"><strong>Provider pin</strong></span>
+          <SandSelect
+            ariaLabel="Bot provider pin"
+            disabled={pending}
+            onValueChange={(value) => setProvider(value as RouterProviderId | "inherit")}
+            options={[{ value: "inherit", label: "Inherit router" }, ...ROUTER_PROVIDERS.map((option) => ({ value: option.id, label: option.label }))]}
+            value={provider}
+          />
+        </label>
+        <SandButton
+          disabled={pending || name.trim().length === 0}
+          onClick={() => {
+            void onCreate({ name: name.trim(), title: title.trim(), description: description.trim(), provider: provider === "inherit" ? null : provider });
+            setName("");
+            setTitle("");
+            setDescription("");
+            setProvider("inherit");
+          }}
+          size="sm"
+          variant="primary"
+        >
+          Create bot
+        </SandButton>
+      </SettingsGroup>
+    </div>
+  );
+}
+
+function BotRow({ bot, disabled, onHide, onDelete }: { bot: SettingsBot; disabled: boolean; onHide(): void; onDelete(): void }) {
+  return (
+    <div className="sand-settings-row">
+      <span className="sand-settings-copy">
+        <strong>{bot.name}</strong>
+        <small>@{bot.slug}{bot.title.length > 0 ? ` · ${bot.title}` : ""}{bot.provider == null ? "" : ` · ${bot.provider}`}</small>
+      </span>
+      <span>
+        <SandButton disabled={disabled} onClick={onHide} size="sm" variant="secondary">{bot.hidden ? "Unhide" : "Hide"}</SandButton>
+        <SandButton disabled={disabled} onClick={onDelete} size="sm" variant="secondary">Delete</SandButton>
+      </span>
+    </div>
   );
 }
 

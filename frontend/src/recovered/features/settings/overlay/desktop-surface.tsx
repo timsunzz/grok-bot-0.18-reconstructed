@@ -28,7 +28,8 @@ import {
   usageMetersFromSummary,
   type SettingsDesktopSnapshot
 } from "./desktop";
-import { GeneralSettingsPanel, RouterSettingsPanel, UpdatesSettingsPanel, UsageSettingsPanel } from "./panels";
+import { BotsSettingsPanel, GeneralSettingsPanel, RouterSettingsPanel, UpdatesSettingsPanel, UsageSettingsPanel } from "./panels";
+import { EMPTY_BOT_ROSTER, loadBotRoster, parseSettingsBotRoster, saveBot, type SettingsBotRoster } from "./bots";
 import { SettingsModalShell, type SettingsSectionId } from "./view";
 import { DEFAULT_ROUTER_PROVIDER, loadRouterProvider, saveRouterProvider, type RouterProviderId } from "./router";
 import type { AutoReviewSettings } from "./auto-review";
@@ -59,6 +60,8 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
   const [cancelTrialDialogOpen, setCancelTrialDialogOpen] = useState(false);
   const [routerProvider, setRouterProvider] = useState<RouterProviderId>(DEFAULT_ROUTER_PROVIDER);
   const [routerPending, setRouterPending] = useState(false);
+  const [botRoster, setBotRoster] = useState<SettingsBotRoster>(EMPTY_BOT_ROSTER);
+  const [botsPending, setBotsPending] = useState(false);
   const handleCancelTrialDialogOpen = useCallback((open: boolean) => setCancelTrialDialogOpen(open), []);
   const handleNotice = useCallback((event: SettingsNoticeEvent) => {
     setSurfaceNotice(settingsNoticeFromEvent(event));
@@ -140,6 +143,11 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
       if (active) setRouterProvider(provider);
     }).catch(() => {
       if (active) setRouterProvider(DEFAULT_ROUTER_PROVIDER);
+    });
+    void loadBotRoster(bridge.agent).then((roster) => {
+      if (active) setBotRoster(roster);
+    }).catch(() => {
+      if (active) setBotRoster(EMPTY_BOT_ROSTER);
     });
     return () => { active = false; };
   }, [bridge, isOpen]);
@@ -247,6 +255,38 @@ export function SettingsDesktopSurface({ bridge, coordinatorClient = null, initi
             onUpgrade={(action) => runUsageUpgradeActionAndRefresh(bridge, action, refreshUsage)}
             state={snapshot.usage}
             provider={routerProvider}
+          />
+        );
+        if (section === "bots") return (
+          <BotsSettingsPanel
+            pending={botsPending}
+            roster={botRoster}
+            onCreate={async (bot) => {
+              setBotsPending(true);
+              try { setBotRoster(await saveBot(bridge.agent, bot)); }
+              catch (reason) {
+                const message = reason instanceof Error ? reason.message : String(reason);
+                publishSurfaceNotice({ kind: "error", operation: "settings-bot-create", message }, handleNotice, onStatus);
+              } finally { setBotsPending(false); }
+            }}
+            onHide={async (botId, hidden) => {
+              if (bridge.agent.hideBot == null) return;
+              setBotsPending(true);
+              try { setBotRoster(parseSettingsBotRoster(await bridge.agent.hideBot(botId, hidden))); }
+              catch (reason) {
+                const message = reason instanceof Error ? reason.message : String(reason);
+                publishSurfaceNotice({ kind: "error", operation: "settings-bot-hide", message }, handleNotice, onStatus);
+              } finally { setBotsPending(false); }
+            }}
+            onDelete={async (botId) => {
+              if (bridge.agent.deleteBot == null) return;
+              setBotsPending(true);
+              try { setBotRoster(parseSettingsBotRoster(await bridge.agent.deleteBot(botId))); }
+              catch (reason) {
+                const message = reason instanceof Error ? reason.message : String(reason);
+                publishSurfaceNotice({ kind: "error", operation: "settings-bot-delete", message }, handleNotice, onStatus);
+              } finally { setBotsPending(false); }
+            }}
           />
         );
         if (section === "router") return (

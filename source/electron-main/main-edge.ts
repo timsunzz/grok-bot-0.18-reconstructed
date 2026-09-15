@@ -7,6 +7,7 @@ import { isValidIanaTimeZone } from "../shared/timezone.js";
 import { sandWebauthnProxyMirroredEnablement } from "../shared/webauthn-proxy-availability.js";
 import { reportDesktopEdgeFailure } from "./desktop-edge-failures.js";
 import { isSandInferenceProvider } from "../shared/inference-router.js";
+import { createBotGroup, deleteBot, hideBot, parseBotRoster, upsertBot, type BotRoster } from "../shared/bot-mode/index.js";
 import { getLocalInferenceCliStatus } from "../shared/node/inference-router-local.js";
 import { isSandBoxRuntime } from "../shared/box-runtime.js";
 import { getLocalDockerStatus, startLocalDockerBox, stopLocalDockerBox } from "./box/local-docker-host-connector.js";
@@ -74,6 +75,23 @@ function themeController(deps: MainEdgeDeps) { return required(deps.readThemeCon
 function egressController(deps: MainEdgeDeps) { return required(deps.readEgressTunnelController, MAIN_EDGE_EGRESS_TUNNEL_UNAVAILABLE, "The egress tunnel controller is not running."); }
 async function echo(deps: MainEdgeDeps, field: string, value: unknown, label: string): Promise<unknown> { const result = await deps.syncHostSettingsToBox({ [field]: value }); if (result == null) throw new SandHostSettingsUnreachableError(`Couldn't reach the computer to save ${label}.`); return result[field] ?? null; }
 function computerUseModel(deps: MainEdgeDeps): unknown { const stored = invoke(deps.agentPrefsStore, "getComputerUseModel"); const override = deps.getComputerUseModelOverride(); return resolveComputerUseModelSelection({ ...(isSandAgentModelSelection(stored) ? { storedModel: stored } : {}), ...(isSandAgentModelSelection(override) ? { overrideModel: override } : {}) }) ?? null; }
+async function persistBotRoster(deps: MainEdgeDeps, next: BotRoster): Promise<BotRoster> {
+  invoke(deps.settingsStore, "setBotRoster", next);
+  try { await deps.syncHostSettingsToBox({ botRoster: next }); }
+  catch (error) { reportDesktopEdgeFailure("host-settings", "bot-roster", error); }
+  return next;
+}
+function botUpsertInput(request: UnknownRecord) {
+  return {
+    ...(typeof request.id === "string" ? { id: request.id } : {}),
+    name: typeof request.name === "string" ? request.name : "",
+    ...(typeof request.title === "string" ? { title: request.title } : {}),
+    ...(typeof request.description === "string" ? { description: request.description } : {}),
+    ...(request.provider === null ? { provider: null } : isSandInferenceProvider(request.provider) ? { provider: request.provider } : {}),
+    ...(request.modelId === null ? { modelId: null } : typeof request.modelId === "string" ? { modelId: request.modelId } : {}),
+    ...(request.hidden === true || request.hidden === false ? { hidden: request.hidden } : {}),
+  };
+}
 function parseAgentModel(value: unknown, requireNonWhitespaceId: boolean): { modelId: string; maxMode: boolean; parameters: { id: string; value: string }[] } | null {
   if (typeof value !== "object" || value == null || Array.isArray(value)) return null;
   const record = value as UnknownRecord;
@@ -113,7 +131,12 @@ export function createMainEdgeHandlers(deps: MainEdgeDeps): HandlerMap {
     setHostSidebarSections: (raw) => echo(deps, "sidebarSections", req(raw).sections, "sidebar sections"),
     getAvailableModels: () => deps.fetchAvailableModels(),
     getInferenceRouter: async () => { const settings = await deps.readHostSettingsFromBox().catch(() => ({} as UnknownRecord)); const provider = invoke(deps.settingsStore, "getInferenceProvider"); return { provider: isSandInferenceProvider(provider) ? provider : "cursor", usage: settings.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, local: getLocalInferenceCliStatus() }; },
-    setInferenceRouter: async (raw) => { const provider = req(raw).provider; invariant(isSandInferenceProvider(provider), "Unknown inference provider."); invoke(deps.settingsStore, "setInferenceProvider", provider); const settings = await deps.syncHostSettingsToBox({ inferenceProvider: provider }).catch(() => null); return { provider, usage: settings?.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, local: getLocalInferenceCliStatus() }; },
+    setInferenceRouter: async (raw) => { const provider = req(raw).provider; invariant(isSandInferenceProvider(provider), "Unknown inference provider."); invoke(deps.settingsStore, "setInferenceProvider", provider); const roster = parseBotRoster(invoke(deps.settingsStore, "getBotRoster")); const settings = await deps.syncHostSettingsToBox({ inferenceProvider: provider, botRoster: roster }).catch(() => null); return { provider, usage: settings?.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, local: getLocalInferenceCliStatus() }; },
+    getBotRoster: async () => { const roster = parseBotRoster(invoke(deps.settingsStore, "getBotRoster")); void deps.syncHostSettingsToBox({ botRoster: roster }).catch((error) => reportDesktopEdgeFailure("host-settings", "bot-roster", error)); return roster; },
+    upsertBot: async (raw) => persistBotRoster(deps, upsertBot(parseBotRoster(invoke(deps.settingsStore, "getBotRoster")), botUpsertInput(req(raw)))),
+    hideBot: async (raw) => { const request = req(raw); invariant(typeof request.botId === "string" && request.botId.length > 0, "hideBot needs botId."); return persistBotRoster(deps, hideBot(parseBotRoster(invoke(deps.settingsStore, "getBotRoster")), request.botId, request.hidden !== false)); },
+    deleteBot: async (raw) => { const request = req(raw); invariant(typeof request.botId === "string" && request.botId.length > 0, "deleteBot needs botId."); return persistBotRoster(deps, deleteBot(parseBotRoster(invoke(deps.settingsStore, "getBotRoster")), request.botId)); },
+    createBotGroup: async (raw) => { const request = req(raw); invariant(typeof request.name === "string" && Array.isArray(request.memberIds), "createBotGroup needs a name and memberIds."); return persistBotRoster(deps, createBotGroup(parseBotRoster(invoke(deps.settingsStore, "getBotRoster")), request.name, request.memberIds.filter((id): id is string => typeof id === "string"))); },
     getBoxRuntime: async () => { const mode = invoke(deps.settingsStore, "getBoxRuntime"); invariant(isSandBoxRuntime(mode), "Unknown box runtime."); return { mode, status: await getLocalDockerStatus(String(Reflect.get(deps.settingsStore, "settingsPath"))) }; },
     setBoxRuntime: async (raw) => { const mode = req(raw).mode; invariant(isSandBoxRuntime(mode), "Unknown box runtime."); const settingsPath = String(Reflect.get(deps.settingsStore, "settingsPath")); invoke(deps.settingsStore, "setBoxRuntime", mode); try { if (mode === "local-docker") await startLocalDockerBox(settingsPath); else await stopLocalDockerBox(); } catch (error) { invoke(deps.settingsStore, "setBoxRuntime", mode === "local-docker" ? "remote" : "local-docker"); throw error; } invoke(deps.boxRecovery, "restartCoordinator"); return { mode, status: await getLocalDockerStatus(settingsPath) }; },
 

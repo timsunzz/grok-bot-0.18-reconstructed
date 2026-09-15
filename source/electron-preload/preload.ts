@@ -264,6 +264,11 @@ export function createDesktopPreloadBridge(options: {
       setInferenceRouter: (provider: string) => edge("setInferenceRouter", { provider }),
       getBoxRuntime: () => edge("getBoxRuntime"),
       setBoxRuntime: (mode: string) => edge("setBoxRuntime", { mode }),
+      getBotRoster: () => edge("getBotRoster"),
+      upsertBot: (bot: unknown) => edge("upsertBot", bot),
+      hideBot: (botId: string, hidden = true) => edge("hideBot", { botId, hidden }),
+      deleteBot: (botId: string) => edge("deleteBot", { botId }),
+      createBotGroup: (name: string, memberIds: readonly string[]) => edge("createBotGroup", { name, memberIds }),
       clientPersistence: {
         read: (key: string) => ipc.invoke(CLIENT_PERSISTENCE_CHANNELS.read, { key }),
         async write(key: string, value: string) { await ipc.invoke(CLIENT_PERSISTENCE_CHANNELS.write, { key, value }); },

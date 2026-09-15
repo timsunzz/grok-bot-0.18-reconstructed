@@ -39,7 +39,17 @@ test("router provider preference defaults to Cursor and round-trips every provid
   }
 });
 
+test("bot roster parser rejects malformed rows and keeps specialists", async () => {
+  const source = await readFile(path.join(repoRoot, "frontend/src/recovered/features/settings/overlay/bots.ts"), "utf8");
+  const { transform } = await import("esbuild");
+  const { code } = await transform(source, { format: "esm", loader: "ts", target: "es2022" });
+  const bots = await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
+  assert.deepEqual(bots.parseSettingsBotRoster({ schemaVersion: 1, bots: [{ id: "bot-1", slug: "alpha", name: "Alpha", hidden: false }] }).bots.map((bot) => bot.slug), ["alpha"]);
+  assert.deepEqual(bots.parseSettingsBotRoster({ schemaVersion: 2, bots: [] }).bots, []);
+});
+
 test("settings registry exposes Router with the native settings icon contract", async () => {
   const source = await readFile(path.join(repoRoot, "frontend/src/recovered/features/settings/overlay/view.tsx"), "utf8");
   assert.match(source, /\{ id: "router", label: "Router", icon: "git-branch" \}/);
+  assert.match(source, /\{ id: "bots", label: "Bots", icon: "agents" \}/);
 });

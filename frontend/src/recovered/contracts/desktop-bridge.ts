@@ -364,6 +364,15 @@ export interface AgentDesktopBridge {
   getComputerUseModel(): Promise<AgentModelSelection | null>;
   setComputerUseModel(model: AgentModelSelection | null): Promise<AgentModelSelection | null>;
   getAvailableModels(): Promise<unknown>;
+  getInferenceRouter?(): Promise<unknown>;
+  setInferenceRouter?(provider: string): Promise<unknown>;
+  getBoxRuntime?(): Promise<unknown>;
+  setBoxRuntime?(mode: string): Promise<unknown>;
+  getBotRoster?(): Promise<unknown>;
+  upsertBot?(bot: unknown): Promise<unknown>;
+  hideBot?(botId: string, hidden?: boolean): Promise<unknown>;
+  deleteBot?(botId: string): Promise<unknown>;
+  createBotGroup?(name: string, memberIds: readonly string[]): Promise<unknown>;
   clientPersistence: {
     read(key: string): Promise<string | null>;
     write(key: string, value: string): Promise<void>;

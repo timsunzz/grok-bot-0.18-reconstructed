@@ -16,8 +16,10 @@ It also adds a few practical experiments:
 - an inference router for Cursor, Claude Code, Codex, and OpenRouter;
 - Grok Bot plugin/MCP tools across the routed providers;
 - local usage tracking for routed inference;
-- an optional local Docker sandbox in place of the remote box; and
-- a reconstructed settings surface integrated into the polished shipped UI.
+- an optional local Docker sandbox in place of the remote box;
+- a reconstructed settings surface integrated into the polished shipped UI; and
+- a local Bot Mode layer (named specialists, `@mention` / `message_agent`,
+  typed delivery failures) inspired by Hermes Agent's bot-mode.
 
 This is a hacking and research project, not Anysphere's original monorepo and
 not an official Grok Bot release. Names and module boundaries inferred from a
@@ -115,6 +117,27 @@ The container:
 Docker Desktop, or another compatible local Docker daemon, must be running.
 Remote mode remains the default.
 
+### Local Bot Mode
+
+**Settings → Bots** stores a roster of named specialists. Each bot can pin its
+own inference provider (or inherit **Settings → Router**), keep standing
+instructions, and message teammates through `message_agent`. Failed routed
+turns now keep sequential transcript ids, classify the error (`[reason:…]`),
+and retry only transient provider failures.
+
+See [docs/BOT-MODE.md](docs/BOT-MODE.md) for the comparison with Hermes Agent.
+
+## Can it run?
+
+| What | Where it works |
+| --- | --- |
+| `npm test`, `npm run typecheck`, `npm run source:typecheck`, `npm run frontend:build` | Linux, macOS, and CI (Node 26.5.x). Git LFS binaries are optional for tests. |
+| `npm run package` / the desktop app | macOS on Apple Silicon only, after `npm run bootstrap` |
+
+This repository is a macOS app reconstruction. The check suite and the
+reconstructed frontend build are the supported way to verify the project on
+Linux or in CI. Packaging still requires the pinned 0.18.0 macOS DMG.
+
 ## Requirements
 
 - macOS on Apple Silicon
@@ -199,7 +222,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for more detail.
 ## Development commands
 
 ```sh
-npm test                  # focused regression tests
+npm test                  # focused regression tests (LFS installers not required)
 npm run typecheck         # renderer TypeScript
 npm run source:typecheck  # runtime TypeScript
 npm run frontend:build    # build the readable renderer reconstruction
