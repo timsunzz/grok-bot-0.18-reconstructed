@@ -5,9 +5,10 @@ import { dirname, join } from "node:path";
 import { runRoutedProviderText } from "../host/extensions/inference/provider-session.js";
 import type { SandInferenceProvider } from "../shared/inference-router.js";
 import { SandSettingsStore } from "../shared/node/settings/sand-settings-store.js";
-import { routedToolIsReadOnly } from "../shared/routed-tool-effects.js";
+import { routedToolCallFailed, routedToolIsReadOnly } from "../shared/routed-tool-effects.js";
 import { classifyRoutedTurnFailure, formatRoutedTurnFailure, routedTurnRetryDelayMs, routedTurnRetryPolicy } from "../shared/routed-turn-failure.js";
 import { createRoutedMcpBridge } from "./routed-mcp-bridge.js";
+import { createRoutedToolBreaker } from "./routed-tool-breaker.js";
 
 const TURN_ID_PATTERN = /^t(\d+)(?:u|s\d+)$/;
 
@@ -176,21 +177,31 @@ export function createCoordinatorInferenceRouter(options: {
       emitTranscript(agentId, assistantStreamStarted ? "updated" : "appended", entry);
       assistantStreamStarted = true;
     };
-    // Every routed tool call funnels through here, whichever transport carries it, so the retry
-    // gate sees one accounting of what this turn has already done.
+    // Every routed tool call funnels through here, whichever transport carries it, so the
+    // breaker and the retry gate see one accounting of what this turn has already done.
+    const breaker = createRoutedToolBreaker();
     let appliedWriteEffect = false;
     const callRoutedTool = async (definition: Record<string, any>, toolArgs: unknown, toolCallId: string): Promise<unknown> => {
+      const server = typeof definition.providerIdentifier === "string" ? definition.providerIdentifier : "";
+      const refusal = breaker.refusal(server);
+      if (refusal != null) return { result: { case: "error", value: { error: refusal } } };
       // Marked before dispatching, not after: a write whose transport died on the way back may
       // still have landed, and that is exactly the case a retry must not replay.
       if (!routedToolIsReadOnly(definition)) appliedWriteEffect = true;
-      return await options.dispatchRemote("executeRoutedMcpTool", {
-        providerIdentifier: definition.providerIdentifier,
-        name: definition.name,
-        toolName: definition.toolName,
-        args: toolArgs,
-        toolCallId,
-        agentId,
-      });
+      let value: unknown;
+      try {
+        value = await options.dispatchRemote("executeRoutedMcpTool", {
+          providerIdentifier: definition.providerIdentifier,
+          name: definition.name,
+          toolName: definition.toolName,
+          args: toolArgs,
+          toolCallId,
+          agentId,
+        });
+      } catch (error) { breaker.recordFailure(server, "unreachable"); throw error; }
+      if (routedToolCallFailed(value)) breaker.recordFailure(server, "rejected");
+      else breaker.recordSuccess(server);
+      return value;
     };
     const bridge = provider === "claude-code" ? await createRoutedMcpBridge({
       listTools: () => options.dispatchRemote("listRoutedMcpTools", {}),

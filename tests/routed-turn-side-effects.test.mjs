@@ -45,6 +45,7 @@ const WRITE_TOOL = { name: "send_email", providerIdentifier: "gmail", toolName: 
 const READ_TOOL = { name: "search_email", providerIdentifier: "gmail", toolName: "search_email", description: "Search email" };
 
 const SUCCESS = { result: { case: "success", value: { content: [], isError: false } } };
+const REJECTED = { result: { case: "error", value: { error: "the plugin said no" } } };
 
 async function seed(dataDir) {
   await rm(dataDir, { recursive: true, force: true });
@@ -52,7 +53,7 @@ async function seed(dataDir) {
   await writeFile(path.join(dataDir, "settings.json"), JSON.stringify({ version: 1, inferenceProvider: "openrouter" }, null, 2));
 }
 
-function harness(dataDir, module, tools) {
+function harness(dataDir, module, tools, toolReply = () => SUCCESS) {
   const executed = [];
   const router = module.createCoordinatorInferenceRouter({
     dataDir,
@@ -61,7 +62,7 @@ function harness(dataDir, module, tools) {
       if (method === "getAgentTranscriptTail") return { entries: [] };
       if (method === "listRoutedMcpTools") return tools;
       if (method === "listAgents") return [];
-      if (method === "executeRoutedMcpTool") { executed.push(args); return SUCCESS; }
+      if (method === "executeRoutedMcpTool") { executed.push(args); return toolReply(args); }
       return null;
     },
     now: () => 1_000,
@@ -130,6 +131,34 @@ test("a turn that only read still gets its retry", { timeout: 90_000 }, async ()
     assert.equal(attempts, 2, "a repeatable read should not cost the turn its retry");
     assert.equal(executed.length, 2);
     assert.equal(entry.content, "found three receipts");
+  } finally {
+    delete globalThis.__routedProviderStub;
+    await loaded.dispose();
+  }
+});
+
+test("a plugin failing every call stops being dispatched to", { timeout: 90_000 }, async () => {
+  const loaded = await loadRouter();
+  try {
+    await seed(loaded.dataDir);
+    const { router, executed } = harness(loaded.dataDir, loaded.module, [READ_TOOL], () => REJECTED);
+
+    const answers = [];
+    globalThis.__routedProviderStub = async (_provider, _messages, options) => {
+      for (let call = 0; call < 5; call += 1) answers.push(await options.executeTool(READ_TOOL, {}, `call-${call}`));
+      return "gave up on the plugin";
+    };
+
+    await router.dispatch("sendPrompt", { agentId: "agent-breaker", prompt: "keep trying", clientNonce: "n3" });
+    await assistantEntry(loaded.dataDir, "agent-breaker");
+
+    // The model is free to keep asking; the point is that asking stops costing a host round trip
+    // and starts returning an answer that tells it to stop.
+    assert.equal(executed.length, 3, "the breaker should have opened after three failures");
+    assert.equal(answers.length, 5);
+    for (const refused of answers.slice(3)) {
+      assert.match(refused.result.value.error, /rejected the last 3 calls/);
+    }
   } finally {
     delete globalThis.__routedProviderStub;
     await loaded.dispose();
