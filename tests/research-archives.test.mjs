@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, open, readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
@@ -14,7 +14,26 @@ async function sha256(file) {
   return hash.digest("hex");
 }
 
-test("preserved 0.18.0 installers match the exact public release inventory", async () => {
+const LFS_POINTER_PREFIX = "version https://git-lfs.github.com/spec/v1";
+
+// The installers are Git LFS objects. A checkout without `git lfs pull` leaves ~134-byte text
+// pointers in their place, and comparing those against the real byte counts reports a bare
+// size mismatch that says nothing about the cause.
+async function unpulledLfsPointers(files) {
+  const pointers = [];
+  for (const file of files) {
+    const handle = await open(file, "r");
+    try {
+      const { buffer, bytesRead } = await handle.read(Buffer.alloc(LFS_POINTER_PREFIX.length), 0, LFS_POINTER_PREFIX.length, 0);
+      if (buffer.subarray(0, bytesRead).toString("utf8") === LFS_POINTER_PREFIX) pointers.push(path.relative(archiveRoot, file));
+    } finally {
+      await handle.close();
+    }
+  }
+  return pointers;
+}
+
+test("preserved 0.18.0 installers match the exact public release inventory", async (t) => {
   const manifest = JSON.parse(await readFile(path.join(archiveRoot, "artifacts.json"), "utf8"));
   assert.deepEqual(Object.keys(manifest).sort(), ["artifacts", "product", "schemaVersion", "version"]);
   assert.equal(manifest.schemaVersion, 1);
@@ -22,6 +41,7 @@ test("preserved 0.18.0 installers match the exact public release inventory", asy
   assert.equal(manifest.version, "0.18.0");
   assert.equal(manifest.artifacts.length, 2);
 
+  const files = [];
   for (const artifact of manifest.artifacts) {
     assert.deepEqual(
       Object.keys(artifact).sort(),
@@ -35,7 +55,18 @@ test("preserved 0.18.0 installers match the exact public release inventory", asy
     const metadata = await lstat(file);
     assert.equal(metadata.isFile(), true);
     assert.equal(metadata.isSymbolicLink(), false);
-    assert.equal(metadata.size, artifact.bytes, `${artifact.path} requires git lfs pull`);
+    files.push(file);
+  }
+
+  const pointers = await unpulledLfsPointers(files);
+  if (pointers.length > 0) {
+    t.skip(`Git LFS objects are not present (${pointers.join(", ")}). Run \`git lfs install && git lfs pull\` to verify the preserved installers.`);
+    return;
+  }
+
+  for (const [index, artifact] of manifest.artifacts.entries()) {
+    const file = files[index];
+    assert.equal((await lstat(file)).size, artifact.bytes, `${artifact.path} does not match the recorded byte count`);
     assert.equal(await sha256(file), artifact.sha256);
   }
 });
