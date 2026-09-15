@@ -53,17 +53,27 @@ export function createCursorAuthWiring(deps: {
   const readLocalToolPermissionCeiling = deps.fetchLocalToolPermissionCeiling ?? (async (getAccessToken: AccessTokenReader) => await fetchLocalToolPermissionCeiling(getAccessToken, {}));
   const syncSentryAccount = deps.syncSentryAccount ?? (async (status: SandAuthStatus, privacyMode: () => Promise<unknown>) => await syncSandSentryAccount(status as Parameters<typeof syncSandSentryAccount>[0], async () => await privacyMode() as PrivacyMode));
 
+  /**
+   * Nothing here may reject. Both callers start this and walk away, and an unhandled rejection in
+   * Electron main is a crashed app rather than a logged warning.
+   *
+   * The store is the part that throws: it refuses to write over a `settings.json` it could not read,
+   * because the host, the coordinator, and Electron main share that file and one process's transient
+   * read failure must not reset every preference for all three. A ceiling that could not be recorded
+   * leaves the ceiling that is already on disk, which is the safe direction.
+   */
   async function syncLocalToolPermissionCeiling(service: AuthServicePort, status: SandAuthStatus): Promise<void> {
-    const sequence = ++localToolCeilingSyncSeq;
-    const previous = deps.settingsStore.getLocalToolPermission();
-    let ceiling: string | undefined;
-    if (status.kind === "logged-in") ceiling = await readLocalToolPermissionCeiling((options) => service.getValidAccessToken(options));
-    if (sequence !== localToolCeilingSyncSeq) return;
-    deps.settingsStore.setLocalToolPermissionCeiling(ceiling);
-    const effective = deps.settingsStore.getLocalToolPermission();
-    if (effective === previous) return;
-    try { await deps.syncHostSettingsToBox({ localToolPermission: effective }); }
-    catch (error) { deps.reportFailure?.("host-settings", "local-tool-ceiling", error); }
+    try {
+      const sequence = ++localToolCeilingSyncSeq;
+      const previous = deps.settingsStore.getLocalToolPermission();
+      let ceiling: string | undefined;
+      if (status.kind === "logged-in") ceiling = await readLocalToolPermissionCeiling((options) => service.getValidAccessToken(options));
+      if (sequence !== localToolCeilingSyncSeq) return;
+      deps.settingsStore.setLocalToolPermissionCeiling(ceiling);
+      const effective = deps.settingsStore.getLocalToolPermission();
+      if (effective === previous) return;
+      await deps.syncHostSettingsToBox({ localToolPermission: effective });
+    } catch (error) { deps.reportFailure?.("host-settings", "local-tool-ceiling", error); }
   }
 
   function deliverCursorAuthStatus(service: AuthServicePort, status: SandAuthStatus): void {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,19 +9,26 @@ import { build } from "esbuild";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-async function loadMainEdge() {
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-main-edge-"));
-  const outfile = path.join(temporary, "main-edge.mjs");
+async function loadBundled(relative, name) {
+  // Inside the repository, not the system temp directory: some of these modules reach a dependency
+  // that is CommonJS, and the shim below can only resolve it from a path under `node_modules`.
+  const temporary = await mkdtemp(path.join(repoRoot, "node_modules", `.grok-${name}-`));
+  const outfile = path.join(temporary, `${name}.mjs`);
   await build({
-    entryPoints: [path.join(repoRoot, "source/electron-main/main-edge.ts")],
+    entryPoints: [path.join(repoRoot, relative)],
     outfile,
     bundle: true,
     format: "esm",
     platform: "node",
     target: "node22",
+    banner: { js: "import { createRequire as __createRequire } from 'node:module';\nconst require = __createRequire(import.meta.url);" },
   });
   const module = await import(`${pathToFileURL(outfile).href}?${Date.now()}`);
   return { module, dispose: () => rm(temporary, { recursive: true, force: true }) };
+}
+
+function loadMainEdge() {
+  return loadBundled("source/electron-main/main-edge.ts", "main-edge");
 }
 
 async function withoutUnhandledRejections(run) {
@@ -114,6 +121,49 @@ test("a provider the box never received is not reported as the active provider",
     assert.equal(storedProvider(), "cursor");
   } finally {
     await loaded.dispose();
+  }
+});
+
+test("a settings file that cannot be read does not take the window down with it", async () => {
+  const wiring = await loadBundled("source/electron-main/account/cursor-auth-wiring.ts", "cursor-auth-wiring");
+  const store = await loadBundled("source/shared/node/settings/sand-settings-store.ts", "sand-settings-store");
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), "grok-auth-wiring-settings-"));
+  try {
+    // A directory where `settings.json` belongs is an unreadable file that reads as `EISDIR`, which
+    // is the shape a permission or IO failure takes. The store deliberately refuses to write over
+    // one — the host, the coordinator, and Electron main share that file, and one process's blip
+    // must not reset every preference for all three — so the refusal arrives here, in a sync both
+    // of whose callers start it and walk away. An unhandled rejection in Electron main is a crashed
+    // app, so this path has to answer for the throw itself.
+    const settingsPath = path.join(dataRoot, "settings.json");
+    await mkdir(settingsPath, { recursive: true });
+    const settingsStore = new store.module.SandSettingsStore(settingsPath);
+    assert.throws(() => settingsStore.setLocalToolPermissionCeiling("read-only"), { code: "EISDIR" });
+
+    const reported = [];
+    const service = { getValidAccessToken: async () => "token" };
+    const wired = wiring.module.createCursorAuthWiring({
+      openExternal: () => {},
+      getAccountRuntime: () => null,
+      emitAuthStatus: () => {},
+      sentryEnabled: false,
+      fetchLocalToolPermissionCeiling: async () => "read-only",
+      settingsStore,
+      syncHostSettingsToBox: async () => {},
+      reportFailure: (area, leg, error) => reported.push(`${area}/${leg}: ${error?.code ?? error?.message}`),
+    });
+
+    const observed = await withoutUnhandledRejections(async () => {
+      wired.deliverCursorAuthStatus(service, { kind: "logged-in" });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    assert.deepEqual(observed, []);
+    assert.deepEqual(reported, ["host-settings/local-tool-ceiling: EISDIR"]);
+  } finally {
+    await wiring.dispose();
+    await store.dispose();
+    await rm(dataRoot, { recursive: true, force: true });
   }
 });
 
