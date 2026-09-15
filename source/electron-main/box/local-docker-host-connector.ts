@@ -17,6 +17,10 @@ export const LOCAL_DOCKER_OWNER_LABEL = "com.grok-bot.local-vm=1";
 export const LOCAL_DOCKER_SCHEMA_VERSION = "6";
 const READY_TIMEOUT_MS = 180_000;
 const OPTIONAL_CREDENTIAL_TIMEOUT_MS = 3_000;
+// `docker run` may pull an image, so lifecycle commands get a long deadline. The daemon probe
+// behind a settings page must not sit there for two minutes.
+const DOCKER_COMMAND_TIMEOUT_MS = 120_000;
+const DOCKER_PROBE_TIMEOUT_MS = 10_000;
 
 export interface LocalDockerStatus {
   readonly available: boolean;
@@ -31,15 +35,29 @@ interface CommandResult { readonly ok: boolean; readonly output: string }
 interface InferenceCredential { readonly accessToken: string; readonly backendUrl: string; readonly expiresAtMs: number }
 interface LocalHostBundle { readonly path: string; readonly sha256: string; readonly boxExecDaemonPath: string; readonly boxExecDaemonSha256: string }
 
-function runDocker(args: readonly string[]): Promise<CommandResult> {
+function runDocker(args: readonly string[], timeoutMs = DOCKER_COMMAND_TIMEOUT_MS): Promise<CommandResult> {
   return new Promise((resolve) => {
     const child = spawn("docker", [...args], { stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
+    let settled = false;
     const append = (chunk: Buffer): void => { output += chunk.toString(); if (output.length > 200_000) output = output.slice(-200_000); };
+    const settle = (result: CommandResult): void => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
+    // A wedged Docker daemon otherwise leaves this promise pending forever, which hangs the
+    // settings IPC call and every coordinator reconnect behind it.
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      // The kill only reaches `docker` itself. Anything it left holding these pipes would keep
+      // the event loop alive, so stop listening to a child we have already given up on.
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+      settle({ ok: false, output: `${output}\ndocker ${args[0] ?? ""} did not respond within ${Math.round(timeoutMs / 1_000)}s.`.trim() });
+    }, timeoutMs);
+    timer.unref();
     child.stdout?.on("data", append);
     child.stderr?.on("data", append);
-    child.once("error", (error) => resolve({ ok: false, output: `${output}\n${error.message}`.trim() }));
-    child.once("close", (code) => resolve({ ok: code === 0, output: output.trim() }));
+    child.once("error", (error) => settle({ ok: false, output: `${output}\n${error.message}`.trim() }));
+    child.once("close", (code) => settle({ ok: code === 0, output: output.trim() }));
   });
 }
 
@@ -102,7 +120,7 @@ async function inspectContainer(): Promise<{ exists: boolean; running: boolean; 
 }
 
 export async function getLocalDockerStatus(settingsPath: string): Promise<LocalDockerStatus> {
-  const daemon = await runDocker(["info", "--format", "{{.ServerVersion}}"]).catch(() => ({ ok: false, output: "Docker is not installed." }));
+  const daemon = await runDocker(["info", "--format", "{{.ServerVersion}}"], DOCKER_PROBE_TIMEOUT_MS).catch(() => ({ ok: false, output: "Docker is not installed." }));
   if (!daemon.ok) return { available: false, running: false, ready: false, containerName: LOCAL_DOCKER_BOX_CONTAINER, image: LOCAL_DOCKER_BOX_IMAGE, detail: daemon.output || "Docker is not running." };
   const inspected = await inspectContainer();
   if (!inspected.exists) return { available: true, running: false, ready: false, containerName: LOCAL_DOCKER_BOX_CONTAINER, image: LOCAL_DOCKER_BOX_IMAGE, detail: "Ready to create the local VM." };
@@ -112,6 +130,14 @@ export async function getLocalDockerStatus(settingsPath: string): Promise<LocalD
 }
 
 let ensureInFlight: Promise<GatewayConnection> | undefined;
+
+// One fixed container name means one provisioning pass at a time. The settings IPC path and the
+// coordinator reconnect path both provision, and overlapping `docker run --name` attempts make
+// one of them fail with a name conflict.
+function ensureSingleFlight(run: () => Promise<GatewayConnection>): Promise<GatewayConnection> {
+  if (ensureInFlight == null) ensureInFlight = run().finally(() => { ensureInFlight = undefined; });
+  return ensureInFlight;
+}
 
 async function isDirectory(path: string): Promise<boolean> {
   try { return (await stat(path)).isDirectory(); } catch { return false; }
@@ -203,20 +229,41 @@ async function ensureLocalDockerBox(settingsPath: string, inferenceCredential?: 
     if (!created.ok) throw new Error(`Could not create the local Docker VM: ${created.output}`);
   }
   const deadline = Date.now() + READY_TIMEOUT_MS;
+  let failure = "Local Docker VM did not expose its gateway within three minutes.";
   while (Date.now() < deadline) {
     if (await gatewayReady(token)) return { baseUrl: LOCAL_DOCKER_GATEWAY_URL, token };
-    const state = await inspectContainer();
-    if (!state.running) {
+    const state = await inspectContainer().catch(() => null);
+    if (state == null || !state.running) {
       const logs = await runDocker(["logs", "--tail", "80", LOCAL_DOCKER_BOX_CONTAINER]);
-      throw new Error(`Local Docker VM stopped before its gateway became ready.\n${logs.output}`);
+      failure = `Local Docker VM stopped before its gateway became ready.\n${logs.output}`;
+      break;
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
-  throw new Error("Local Docker VM did not expose its gateway within three minutes.");
+  // Callers roll the box runtime back to remote when this throws, so a container left running
+  // here would keep holding the loopback ports and CPU with nothing attached to it. Stopping
+  // rather than removing keeps the logs and volumes available for diagnosis.
+  await stopOwnedContainerQuietly();
+  throw new Error(failure);
+}
+
+async function stopOwnedContainerQuietly(): Promise<void> {
+  const inspected = await inspectContainer().catch(() => null);
+  if (inspected == null || !inspected.exists || !inspected.owned || !inspected.running) return;
+  await runDocker(["stop", "--time", "10", LOCAL_DOCKER_BOX_CONTAINER]);
+}
+
+// `ensureLocalDockerBox` and `stopLocalDockerBox` both refuse to touch a container they do not
+// own. The recreate paths run `restart` and `rm --force` on a fixed name, so they need the
+// same guard or a user's unrelated container of that name is destroyed for them.
+async function unownedContainerRefusal(action: string): Promise<string | null> {
+  const inspected = await inspectContainer().catch(() => null);
+  if (inspected == null || !inspected.exists || inspected.owned) return null;
+  return `Refusing to ${action} ${LOCAL_DOCKER_BOX_CONTAINER}: an unowned container already has that name.`;
 }
 
 export async function startLocalDockerBox(settingsPath: string): Promise<GatewayConnection> {
-  return await ensureLocalDockerBox(settingsPath);
+  return await ensureSingleFlight(() => ensureLocalDockerBox(settingsPath));
 }
 
 export async function stopLocalDockerBox(): Promise<void> {
@@ -231,16 +278,13 @@ export function createSettingsRoutedHostConnector(
   remote: SandRemoteHostConnector,
   settings: SandSettingsStore,
 ): SandRemoteHostConnector {
-  const localConnect = (): Promise<GatewayConnection> => {
-    if (ensureInFlight == null) ensureInFlight = (async () => {
-      const issued = remote.issueInferenceCredential == null ? undefined : await Promise.race([
-        remote.issueInferenceCredential(),
-        new Promise<undefined>((resolve) => setTimeout(resolve, OPTIONAL_CREDENTIAL_TIMEOUT_MS)),
-      ]);
-      return await ensureLocalDockerBox(settings.settingsPath, issued);
-    })().finally(() => { ensureInFlight = undefined; });
-    return ensureInFlight;
-  };
+  const localConnect = (): Promise<GatewayConnection> => ensureSingleFlight(async () => {
+    const issued = remote.issueInferenceCredential == null ? undefined : await Promise.race([
+      remote.issueInferenceCredential(),
+      new Promise<undefined>((resolve) => setTimeout(resolve, OPTIONAL_CREDENTIAL_TIMEOUT_MS)),
+    ]);
+    return await ensureLocalDockerBox(settings.settingsPath, issued);
+  });
   return {
     connect: async () => settings.getBoxRuntime() === "local-docker" ? await localConnect() : await remote.connect(),
     ...(remote.issueLocalExecDaemonCredential == null ? {} : { issueLocalExecDaemonCredential: remote.issueLocalExecDaemonCredential.bind(remote) }),
@@ -250,6 +294,8 @@ export function createSettingsRoutedHostConnector(
         if (remote.recreate == null) throw new Error("Remote computer recreation is unavailable.");
         return await remote.recreate(args);
       }
+      const refusal = await unownedContainerRefusal("restart");
+      if (refusal != null) throw new Error(refusal);
       const stopped = await runDocker(["restart", LOCAL_DOCKER_BOX_CONTAINER]);
       if (!stopped.ok) throw new Error(`Could not restart the local Docker VM: ${stopped.output}`);
       await localConnect();
@@ -260,6 +306,8 @@ export function createSettingsRoutedHostConnector(
         if (remote.forceRecreate == null) return { status: "rejected", reason: "Remote computer reset is unavailable." };
         return await remote.forceRecreate();
       }
+      const refusal = await unownedContainerRefusal("remove");
+      if (refusal != null) return { status: "rejected", reason: refusal };
       const removed = await runDocker(["rm", "--force", LOCAL_DOCKER_BOX_CONTAINER]);
       if (!removed.ok && !/no such container/i.test(removed.output)) return { status: "rejected", reason: removed.output };
       await localConnect();
