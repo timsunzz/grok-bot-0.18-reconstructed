@@ -44,11 +44,16 @@ export function mergeAgentInboundQueue<T extends { priority?: boolean }>(
     older = partitionAgentInbound(deferred);
   return [...newer.priority, ...older.priority, ...older.rest, ...newer.rest];
 }
+export const AGENT_INBOUND_RETRY_DELAY_MS = 1_000;
 
 export class AgentToAgentMessaging {
   readonly pendingAgentInbound = new Map<string, AgentInboundMessage[]>();
   readonly revivingAgentInboundIds = new Set<string>();
-  constructor(readonly tm: TranscriptManagerLike) {}
+  readonly retryingAgentInboundIds = new Set<string>();
+  constructor(
+    readonly tm: TranscriptManagerLike,
+    readonly retryDelayMs = AGENT_INBOUND_RETRY_DELAY_MS,
+  ) {}
 
   async sendToAgent(
     fromAgentId: string,
@@ -154,6 +159,7 @@ export class AgentToAgentMessaging {
     )
       return;
     this.revivingAgentInboundIds.add(agentId);
+    let shouldRetry = false;
     try {
       while ((this.pendingAgentInbound.get(agentId)?.length ?? 0) > 0) {
         const messages = prioritizeAgentInbound(
@@ -177,12 +183,29 @@ export class AgentToAgentMessaging {
               messages,
             ),
           );
+          shouldRetry = true;
           break;
         }
       }
     } finally {
       this.revivingAgentInboundIds.delete(agentId);
     }
+    if (shouldRetry) this.scheduleAgentInboundRetry(agentId);
+  }
+
+  scheduleAgentInboundRetry(agentId: string): void {
+    if (
+      this.tm.sessions.isAgentGone(agentId) ||
+      this.retryingAgentInboundIds.has(agentId)
+    )
+      return;
+    this.retryingAgentInboundIds.add(agentId);
+    const timer = setTimeout(() => {
+      this.retryingAgentInboundIds.delete(agentId);
+      if ((this.pendingAgentInbound.get(agentId)?.length ?? 0) > 0)
+        void this.reviveForAgentInbound(agentId);
+    }, this.retryDelayMs);
+    timer.unref?.();
   }
 
   async runAgentInboundWake(
@@ -210,85 +233,102 @@ export class AgentToAgentMessaging {
         session.id,
         async () => {
           runStarted = true;
-          this.appendAgentInboundEntries(
-            session,
-            messages.filter((message) => message.isDisplayed !== true),
-          );
-          this.tm.turnRuntime.activeRequestPrompts.delete(session.id);
-          this.tm.turnRuntime.activeRequestSources.set(session.id, "agent");
-          this.tm.backgroundWakes.dmPreemptedWakeAgentIds.delete(session.id);
           try {
-            for (const [index, message] of messages.entries()) {
-              if (
-                index > 0 &&
-                (this.pendingAgentInbound.get(agentId) ?? []).some(
-                  (pending) => pending.priority === true,
-                )
-              ) {
-                const deferred = messages
-                  .slice(index)
-                  .map((remaining) => ({ ...remaining, isDisplayed: true }));
-                this.pendingAgentInbound.set(
-                  agentId,
-                  mergeAgentInboundQueue(
-                    this.pendingAgentInbound.get(agentId) ?? [],
-                    deferred,
-                  ),
-                );
-                return;
-              }
-              const selectedImages = await loadAgentInboundImages(
-                message.images,
+            if (
+              (this.pendingAgentInbound.get(agentId) ?? []).some(
+                (pending) => pending.priority === true,
+              )
+            ) {
+              this.pendingAgentInbound.set(
+                agentId,
+                mergeAgentInboundQueue(
+                  this.pendingAgentInbound.get(agentId) ?? [],
+                  messages,
+                ),
               );
-              const result = await runner.run(
-                buildAgentInboundWakePrompt(message),
-                {
-                  hidden: true,
-                  isSilenceAllowed: true,
-                  ...(selectedImages.length === 0 ? {} : { selectedImages }),
-                },
-              );
-              const preempted =
-                this.tm.backgroundWakes.dmPreemptedWakeAgentIds.delete(
-                  session.id,
-                );
-              if (result.aborted && result.quiescedForUpgrade !== true) {
-                if (!preempted || this.tm.sessions.isAgentGone(agentId)) return;
-                const redrivable = messages
-                  .slice(index)
-                  .filter((remaining) => remaining.isRedriven !== true)
-                  .map((remaining) => ({
-                    ...remaining,
-                    isDisplayed: true,
-                    isRedriven: true,
-                  }));
-                if (redrivable.length > 0)
+              return;
+            }
+            this.appendAgentInboundEntries(
+              session,
+              messages.filter((message) => message.isDisplayed !== true),
+            );
+            this.tm.turnRuntime.activeRequestPrompts.delete(session.id);
+            this.tm.turnRuntime.activeRequestSources.set(session.id, "agent");
+            this.tm.backgroundWakes.dmPreemptedWakeAgentIds.delete(session.id);
+            try {
+              for (const [index, message] of messages.entries()) {
+                if (
+                  index > 0 &&
+                  (this.pendingAgentInbound.get(agentId) ?? []).some(
+                    (pending) => pending.priority === true,
+                  )
+                ) {
+                  const deferred = messages
+                    .slice(index)
+                    .map((remaining) => ({ ...remaining, isDisplayed: true }));
                   this.pendingAgentInbound.set(
                     agentId,
                     mergeAgentInboundQueue(
                       this.pendingAgentInbound.get(agentId) ?? [],
-                      redrivable,
+                      deferred,
                     ),
                   );
-                return;
+                  return;
+                }
+                const selectedImages = await loadAgentInboundImages(
+                  message.images,
+                );
+                const result = await runner.run(
+                  buildAgentInboundWakePrompt(message),
+                  {
+                    hidden: true,
+                    isSilenceAllowed: true,
+                    ...(selectedImages.length === 0 ? {} : { selectedImages }),
+                  },
+                );
+                const preempted =
+                  this.tm.backgroundWakes.dmPreemptedWakeAgentIds.delete(
+                    session.id,
+                  );
+                if (result.aborted && result.quiescedForUpgrade !== true) {
+                  if (!preempted || this.tm.sessions.isAgentGone(agentId))
+                    return;
+                  const redrivable = messages
+                    .slice(index)
+                    .filter((remaining) => remaining.isRedriven !== true)
+                    .map((remaining) => ({
+                      ...remaining,
+                      isDisplayed: true,
+                      isRedriven: true,
+                    }));
+                  if (redrivable.length > 0)
+                    this.pendingAgentInbound.set(
+                      agentId,
+                      mergeAgentInboundQueue(
+                        this.pendingAgentInbound.get(agentId) ?? [],
+                        redrivable,
+                      ),
+                    );
+                  return;
+                }
               }
+              await this.tm.roster.emitAgentUpdate(session.id);
+            } catch (error) {
+              this.tm.telemetry.reportAgentError({
+                source: "agent",
+                conversationId: session.id,
+                requestId: this.tm.runLifecycle.lastRequestIdBySession.get(
+                  session.id,
+                ),
+                error: classifyAgentError(error),
+                detail: sandErrorDetail(error),
+              });
+              this.tm.trayErrors.pushError({
+                agentId: session.id,
+                title: "Message from another agent failed",
+                ...describeAgentRunError(error),
+              });
             }
-            await this.tm.roster.emitAgentUpdate(session.id);
-          } catch (error) {
-            this.tm.telemetry.reportAgentError({
-              source: "agent",
-              conversationId: session.id,
-              requestId: this.tm.runLifecycle.lastRequestIdBySession.get(
-                session.id,
-              ),
-              error: classifyAgentError(error),
-              detail: sandErrorDetail(error),
-            });
-            this.tm.trayErrors.pushError({
-              agentId: session.id,
-              title: "Message from another agent failed",
-              ...describeAgentRunError(error),
-            });
           } finally {
             this.tm.runLifecycle.endSessionRun(session);
           }
@@ -326,6 +366,7 @@ export class AgentToAgentMessaging {
       raisesActivity ||= entryRaisesUserActivitySignal(entry);
       if (isActive) this.tm.appendEntry(entry);
       else session.db.appendTranscriptEntry(entry);
+      message.isDisplayed = true;
     }
     if (!isActive) {
       if (raisesActivity) this.tm.sessionStore.markSessionActivity(session);
