@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { DEFAULT_SAND_THEME_PREFERENCE, isSandThemePreference, type SandThemePreference } from "../../desktop.js";
@@ -92,10 +93,23 @@ function parseSettings(value: unknown): SandStoredSettings | null {
 
 export class SandSettingsStore {
   constructor(readonly settingsPath: string) {}
-  load(): SandStoredSettings {
-    if (!existsSync(this.settingsPath)) return emptySettings();
-    try { const parsed = parseSettings(JSON.parse(readFileSync(this.settingsPath, "utf8")) as unknown); return parsed == null ? emptySettings() : this.applyPendingMigrations(parsed); }
-    catch { return emptySettings(); }
+  load(): SandStoredSettings { return this.read().settings; }
+  // `unreadable` separates "there is nothing here yet" from "there is something here we could
+  // not understand". Only the first may be overwritten with defaults; see `update`.
+  private read(): { readonly settings: SandStoredSettings; readonly unreadable: boolean } {
+    let raw: string;
+    try { raw = readFileSync(this.settingsPath, "utf8"); }
+    catch (error) { return { settings: emptySettings(), unreadable: (error as { code?: unknown }).code !== "ENOENT" }; }
+    try {
+      const parsed = parseSettings(JSON.parse(raw) as unknown);
+      return parsed == null ? { settings: emptySettings(), unreadable: true } : { settings: this.applyPendingMigrations(parsed), unreadable: false };
+    } catch { return { settings: emptySettings(), unreadable: true }; }
+  }
+  // A transient read error, a truncated file, or a file written by a newer schema would
+  // otherwise be replaced by defaults on the next write, losing every stored preference
+  // silently. Move it aside first so it can be recovered.
+  private quarantineUnreadable(): void {
+    try { renameSync(this.settingsPath, `${this.settingsPath}.unreadable-${Date.now()}`); } catch {}
   }
   private applyPendingMigrations(settings: SandStoredSettings): SandStoredSettings {
     if (settings.settingsMigrations.includes(SAND_DOWNGRADE_MAX_FAST_MIGRATION_ID)) return settings;
@@ -103,8 +117,25 @@ export class SandSettingsStore {
     try { this.persist(migrated); } catch {}
     return migrated;
   }
-  persist(settings: SandStoredSettings): void { mkdirSync(dirname(this.settingsPath), { recursive: true }); const temp = `${this.settingsPath}.${process.pid}.tmp`; writeFileSync(temp, JSON.stringify(settings, null, 2), "utf8"); renameSync(temp, this.settingsPath); }
-  private update(mutator: (settings: SandStoredSettings) => SandStoredSettings): void { this.persist(mutator(this.load())); }
+  persist(settings: SandStoredSettings): void {
+    mkdirSync(dirname(this.settingsPath), { recursive: true });
+    // The host can run inside the local Docker box with this directory bind-mounted, so two
+    // writers can legitimately share a pid. A random suffix keeps their temp files distinct,
+    // and 0600 matches how the rest of the data root is written.
+    const temp = `${this.settingsPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temp, JSON.stringify(settings, null, 2), { encoding: "utf8", mode: 0o600 });
+      renameSync(temp, this.settingsPath);
+    } catch (error) {
+      try { rmSync(temp, { force: true }); } catch {}
+      throw error;
+    }
+  }
+  private update(mutator: (settings: SandStoredSettings) => SandStoredSettings): void {
+    const { settings, unreadable } = this.read();
+    if (unreadable) this.quarantineUnreadable();
+    this.persist(mutator(settings));
+  }
   getHasSeenOnboarding(): boolean | undefined { return this.load().hasSeenOnboarding; }
   setHasSeenOnboarding(value: boolean): void { this.update((current) => { const { hasSeenOnboardingAccountScope: _old, ...rest } = current; return { ...rest, hasSeenOnboarding: value, ...(rest.mcpCustomInstructionsAccountScope === undefined ? {} : { hasSeenOnboardingAccountScope: rest.mcpCustomInstructionsAccountScope }) }; }); }
   clearHasSeenOnboarding(): void { this.update((current) => { const { hasSeenOnboarding: _seen, hasSeenOnboardingAccountScope: _owner, ...rest } = current; return rest; }); }
