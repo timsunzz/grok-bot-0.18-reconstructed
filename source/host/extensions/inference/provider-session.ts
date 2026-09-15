@@ -187,8 +187,10 @@ function routedIdleWatchdog(provider: RoutedProvider, runtime: RoutedRuntime): R
       try { return await work(); }
       finally { working -= 1; settle(); }
     },
-    // The request is this turn's alone, and nothing is reading it any more.
-    abandoned: () => controller.abort(routedTimeoutError(provider, idleMs)),
+    // The request is this turn's alone, and nothing is reading it any more. `AbortError` rather than
+    // the deadline's own name, because a consumer that walked away is a cancellation and a cancelled
+    // turn is deliberately never retried.
+    abandoned: () => controller.abort(Object.assign(new Error(`Nothing is reading the ${provider} response, so its request was closed.`), { name: "AbortError" })),
     stop,
   };
 }
