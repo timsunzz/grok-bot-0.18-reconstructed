@@ -194,7 +194,9 @@ The main source areas are:
   and verification; and
 - `tests/` — publication and router regressions.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for more detail.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for more detail, and
+[docs/BOT-MODE.md](docs/BOT-MODE.md) for how Grok Bot's multi-agent core
+compares with Hermes Agent Bot Mode.
 
 ## Development commands
 

@@ -13,6 +13,14 @@ export const SAND_SEND_ACCEPTANCE_FILE_NAME = "send-acceptance.json";
 export const MAX_RECORDS = 256;
 export const MAX_DEGRADED_WINDOWS = 8;
 export class PromptAcceptanceRejectedError extends Error {}
+export class PromptAcceptanceUnknownDurabilityError extends Error {
+  constructor(clientNonce: string) {
+    super(
+      `unknown-durability: clientNonce ${clientNonce} cannot be dispatched because the acceptance ledger is unreadable`,
+    );
+    this.name = "PromptAcceptanceUnknownDurabilityError";
+  }
+}
 export class PromptAcceptanceDigestMismatchError extends Error {
   readonly code = NONCE_DIGEST_MISMATCH;
   constructor(clientNonce: string) {
@@ -243,6 +251,9 @@ export class PromptAcceptanceLedger {
     inputDigest: string;
   }): { kind: "dispatch" } | { kind: "duplicate"; record: AcceptanceRecord } {
     const found = this.lookup(args);
+    if (found.outcome === "unknown-durability") {
+      throw new PromptAcceptanceUnknownDurabilityError(args.clientNonce);
+    }
     if (found.outcome !== "found") return { kind: "dispatch" };
     if (found.record.inputDigest !== args.inputDigest)
       throw new PromptAcceptanceDigestMismatchError(args.clientNonce);

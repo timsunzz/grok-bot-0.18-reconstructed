@@ -46,7 +46,24 @@ export function scheduleConversationSizeMaintenance(host: ConversationGcHost, db
   void (async () => { try { const size = await measureConversationBlobBytes(path); if (size < conversationSoftLimitBytes()) return; state.lastRunMs = Date.now(); reportConversationGcVerdict("soft_schedule", dbPath, await runConversationGc(host, dbPath, db)); } catch (error) { reportConversationGcVerdict("soft_schedule", dbPath, { outcome: "failed" }); reportSessionDiagnostic({ family: "maintenance", kind: "conversation_gc_failed", agentId: basename(dirname(dbPath)), errorClass: errorClass(error) }); } finally { state.inFlight = false; } })();
 }
 export async function ensureConversationCapacityForTurn(host: ConversationGcHost, dbPath: string, db: ConversationDb): Promise<void> {
-  if (!isConversationGcEnabled()) return; const path = blobDbPathFor(dbPath), size = await measureConversationBlobBytes(path), hard = conversationHardLimitBytes(); if (size < hard) { if (size >= conversationSoftLimitBytes()) scheduleConversationSizeMaintenance(host, dbPath, db); return; }
-  let result: ConversationGcVerdict; try { result = await runConversationGc(host, dbPath, db); } catch (error) { reportConversationGcVerdict("turn_gate", dbPath, { outcome: "failed" }); reportSessionDiagnostic({ family: "maintenance", kind: "conversation_gc_failed", agentId: basename(dirname(dbPath)), errorClass: errorClass(error) }); return; }
-  if (result?.outcome !== "collected") { reportConversationGcVerdict("turn_gate", dbPath, result); return; } const after = await measureConversationBlobBytes(path), stillOverCap = after >= hard; reportConversationGcVerdict("turn_gate", dbPath, result, stillOverCap); if (stillOverCap) throw new SandConversationTooLargeError(after, hard);
+  const path = blobDbPathFor(dbPath), size = await measureConversationBlobBytes(path), hard = conversationHardLimitBytes();
+  if (size < hard) {
+    if (isConversationGcEnabled() && size >= conversationSoftLimitBytes()) scheduleConversationSizeMaintenance(host, dbPath, db);
+    return;
+  }
+  if (!isConversationGcEnabled()) throw new SandConversationTooLargeError(size, hard);
+  let result: ConversationGcVerdict;
+  try { result = await runConversationGc(host, dbPath, db); }
+  catch (error) {
+    reportConversationGcVerdict("turn_gate", dbPath, { outcome: "failed" });
+    reportSessionDiagnostic({ family: "maintenance", kind: "conversation_gc_failed", agentId: basename(dirname(dbPath)), errorClass: errorClass(error) });
+    throw new SandConversationTooLargeError(size, hard);
+  }
+  if (result?.outcome !== "collected") {
+    reportConversationGcVerdict("turn_gate", dbPath, result);
+    throw new SandConversationTooLargeError(size, hard);
+  }
+  const after = await measureConversationBlobBytes(path), stillOverCap = after >= hard;
+  reportConversationGcVerdict("turn_gate", dbPath, result, stillOverCap);
+  if (stillOverCap) throw new SandConversationTooLargeError(after, hard);
 }

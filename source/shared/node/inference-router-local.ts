@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
@@ -8,13 +8,41 @@ export interface LocalInferenceCliStatus {
   readonly executablePath: string | null;
 }
 
+function isUserOwnedRegularFile(stats: { readonly isFile(): boolean; readonly uid: number; readonly mode: number }): boolean {
+  if (!stats.isFile()) return false;
+  if (typeof process.getuid === "function" && stats.uid !== process.getuid()) return false;
+  return true;
+}
+
 function firstExecutable(candidates: readonly (string | undefined)[]): string | null {
-  for (const candidate of candidates) if (candidate != null && candidate.length > 0 && existsSync(candidate)) return candidate;
+  for (const candidate of candidates) {
+    if (candidate == null || candidate.length === 0) continue;
+    try {
+      const stats = statSync(candidate);
+      if (stats.isFile() && (stats.mode & 0o111) !== 0) return candidate;
+    } catch {}
+  }
   return null;
 }
 
 function pathCandidates(name: string): string[] {
   return (process.env.PATH ?? "").split(delimiter).filter(Boolean).map(directory => join(directory, name));
+}
+
+export function resolvePrivateRegularFile(path: string): string | null {
+  try {
+    const link = lstatSync(path);
+    const stats = link.isSymbolicLink() ? statSync(path) : link;
+    if (!isUserOwnedRegularFile(stats)) return null;
+    if ((stats.mode & 0o077) !== 0) {
+      try { chmodSync(path, 0o600); } catch { return null; }
+      const after = statSync(path);
+      if ((after.mode & 0o077) !== 0) return null;
+    }
+    return path;
+  } catch {
+    return null;
+  }
 }
 
 export function resolveCodexCliPath(): string | null {
@@ -28,9 +56,8 @@ export function resolveClaudeCodeCliPath(): string | null {
 }
 
 function hasUsableCodexLogin(path: string): boolean {
+  if (resolvePrivateRegularFile(path) == null) return false;
   try {
-    const stat = lstatSync(path);
-    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) return false;
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, any>;
     return parsed.auth_mode === "chatgpt"
       && typeof parsed.tokens?.access_token === "string" && parsed.tokens.access_token.length > 0

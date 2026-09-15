@@ -6,7 +6,27 @@ export class SandGroupNestingError extends Error { readonly nestedGroupIds: stri
 export function assertMembersAreNotGroups(ids: readonly string[], isGroupId: (id: string) => boolean): void { const nested = [...new Set(ids)].filter(isGroupId); if (nested.length > 0) throw new SandGroupNestingError(nested); }
 export function memberMentionHandles(name: string): string[] { const lower = name.trim().toLowerCase(); if (!lower) return []; const handles = new Set([lower, lower.replace(/\s+/g, "")]); const first = lower.split(/\s+/)[0]; if (first) handles.add(first); return [...handles]; }
 function isWordChar(char: string | undefined): boolean { return char !== undefined && /[a-z0-9]/.test(char); } function hasMentionAt(lower: string, handle: string): boolean { const needle = `@${handle}`; for (let index = lower.indexOf(needle); index >= 0; index = lower.indexOf(needle, index + 1)) if (!isWordChar(lower[index - 1]) && !isWordChar(lower[index + needle.length])) return true; return false; }
-export function parseGroupMentions(text: string, members: readonly Pick<GroupMember, "id" | "name">[]): { isEveryone: boolean; memberIds: string[] } { const lower = text.toLowerCase(), memberIds: string[] = [], seen = new Set<string>(); for (const member of members) { if (!seen.has(member.id) && memberMentionHandles(member.name).some((handle) => hasMentionAt(lower, handle))) { memberIds.push(member.id); seen.add(member.id); } } return { isEveryone: /(?:^|[^a-z0-9])@(everyone|all)\b/.test(lower), memberIds }; }
+export function parseGroupMentions(text: string, members: readonly Pick<GroupMember, "id" | "name">[]): { isEveryone: boolean; memberIds: string[] } {
+  const lower = text.toLowerCase(), memberIds: string[] = [], seen = new Set<string>();
+  const handleOwners = new Map<string, string[]>();
+  for (const member of members) {
+    for (const handle of [...memberMentionHandles(member.name), member.id.toLowerCase()]) {
+      const owners = handleOwners.get(handle) ?? [];
+      if (!owners.includes(member.id)) owners.push(member.id);
+      handleOwners.set(handle, owners);
+    }
+  }
+  for (const member of members) {
+    if (seen.has(member.id)) continue;
+    const handles = [...memberMentionHandles(member.name), member.id.toLowerCase()];
+    const unique = handles.filter((handle) => (handleOwners.get(handle) ?? []).length === 1);
+    if (unique.some((handle) => hasMentionAt(lower, handle))) {
+      memberIds.push(member.id);
+      seen.add(member.id);
+    }
+  }
+  return { isEveryone: /(?:^|[^a-z0-9])@(everyone|all)\b/.test(lower), memberIds };
+}
 export function resolveResponders<T extends Pick<GroupMember, "id" | "name">>(members: readonly T[], history: readonly GroupMessage[]): T[] { let start = 0; for (let index = history.length - 1; index >= 0; index -= 1) if (history[index]?.speaker.kind === "user") { start = index; break; } let everyone = false; const mentioned = new Set<string>(); for (const message of history.slice(start)) { const targets = parseGroupMentions(message.content, members); everyone ||= targets.isEveryone; for (const id of targets.memberIds) mentioned.add(id); } return everyone || mentioned.size === 0 ? [...members] : members.filter((member) => mentioned.has(member.id)); }
 export function isPassContent(content: string): boolean { const trimmed = content.trim(); return !trimmed || /^\(?\s*pass\s*\)?\.?$/i.test(trimmed); } export function isPotentialPassPrefix(text: string): boolean { const trimmed = text.trim(); return !trimmed || isPassContent(trimmed) || /^\(?\s*(?:p(?:a(?:s(?:s\s*\)?\.?)?)?)?)?$/i.test(trimmed); }
 export function buildGroupRedriveNote(): string { return "\n(Redelivery: your previous attempt at this turn was interrupted by a direct message to you. The room has NOT seen any reply from you for the messages above — anything you said or did while handling that direct message stayed in that private chat. If you already did the work, send the result to this room with SendMessage now; otherwise take the turn normally.)"; }

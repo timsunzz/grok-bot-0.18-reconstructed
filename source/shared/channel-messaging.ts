@@ -1,3 +1,7 @@
+import {
+  classifyChannelDeliveryFailure,
+  formatDeliveryNotice,
+} from "./delivery-reasons.js";
 import { clampLine } from "./sand-text.js";
 import {
   findConnectorManifest,
@@ -207,16 +211,16 @@ export function humanizeChannelDeliveryFailure(
       ? (findConnectorManifest(address.platform)?.displayName ?? address.platform)
       : null;
   const trimmed = rawMessage.trim();
-  if (address == null || /not a valid channel address/i.test(trimmed)) {
-    return `"${addressToken}" isn't a valid channel address, so that message wasn't delivered.`;
-  }
-  if (trimmed === "No channel delivery mechanism is registered.") {
-    return "Channel messaging isn't available on this computer, so that message wasn't delivered.";
-  }
-  if (/no live .* connection/i.test(trimmed)) {
-    return `${platformName} isn't connected on this computer, so that message wasn't delivered. Connect ${platformName} (add its token) to send there.`;
-  }
-  return `Couldn't deliver that message to ${platformName}: ${trimmed}`;
+  const reason = classifyChannelDeliveryFailure(addressToken, trimmed);
+  const text =
+    address == null || /not a valid channel address/i.test(trimmed)
+      ? `"${addressToken}" isn't a valid channel address, so that message wasn't delivered.`
+      : trimmed === "No channel delivery mechanism is registered."
+        ? "Channel messaging isn't available on this computer, so that message wasn't delivered."
+      : /no live .* connection/i.test(trimmed)
+        ? `${platformName} isn't connected on this computer, so that message wasn't delivered. Connect ${platformName} (add its token) to send there.`
+        : `Couldn't deliver that message to ${platformName}: ${trimmed}`;
+  return formatDeliveryNotice(reason, text);
 }
 
 export interface ChannelDeliveryFailure {
@@ -235,6 +239,6 @@ export function buildChannelDeliveryFailureWakePrompt(
     `${CHANNEL_DELIVERY_FAILED_WAKE_CUE} A message you tried to send to a channel did not go through.`,
     "This is a system notice about your own outbound send, not the user typing in this app. You may have already told the user it was sent, so correct the record.",
     ...lines,
-    `Tell the user plainly here, in this in-app chat (a SendMessage with no channel target), that the message${plural} didn't go through and why, so they aren't left believing it was delivered. Don't silently retry the same channel; if it isn't connected, offer to help connect it.`,
+    `Tell the user plainly here, in this in-app chat (a SendMessage with no channel target), that the message${plural} didn't go through and why, so they aren't left believing it was delivered. Do not retry [reason:provider_auth_or_access], [reason:provider_quota_limit], or [reason:missing_config]. A single automatic retry is allowed only for transient [reason:provider_rate_limit], [reason:provider_server_error], [reason:delivery_timeout], [reason:runtime_offline], or [reason:context_overflow] failures.`,
   ].join("\n");
 }

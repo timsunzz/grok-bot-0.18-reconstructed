@@ -172,16 +172,20 @@ export function projectMentionMembers(value: unknown, allowEveryone = true): Edi
     const id = nonEmptyString(candidate.id);
     const label = nonEmptyString(candidate.name);
     if (id == null || label == null || seen.has(id)) continue;
-    if (candidate.isHiddenFromSidebar === true || candidate.hiddenFromSidebar === true) continue;
     seen.add(id);
     const members = stringArray(candidate.memberIds ?? candidate.members);
     const isGroup = candidate.isGroup === true;
+    const hidden = candidate.isHiddenFromSidebar === true || candidate.hiddenFromSidebar === true;
     result.push({
       key: `assistants:${id}`,
       id,
       category: "assistants",
       label,
-      ...(isGroup && members.length > 0 ? { subtitle: `${members.length} agents` } : {}),
+      ...(isGroup && members.length > 0
+        ? { subtitle: `${members.length} agents` }
+        : hidden
+          ? { subtitle: "Hidden" }
+          : {}),
       keywords: [label, typeof candidate.title === "string" ? candidate.title : ""].filter((entry) => entry.length > 0),
       icon: isGroup ? { type: "group" } : { type: "agent" },
       isGroup,

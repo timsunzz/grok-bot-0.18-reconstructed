@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { SAND_DEFAULT_AGENT_NAME } from "../../../shared/agents/agents.js";
+import { classifyErrorForDelivery, formatDeliveryNotice } from "../../../shared/delivery-reasons.js";
 import {
   formatRemoteAgentId,
   isRemoteAgentId,
@@ -377,6 +379,7 @@ export class GroupChatGlue {
       lastReactionApplied: () => lastReactionApplied,
     };
 
+    let memberTurnError: unknown;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       this.finalizeGroupMemberStream(roomSession, live);
       lastReactionApplied = false;
@@ -441,8 +444,8 @@ export class GroupChatGlue {
                 memberTurnTrace?.span.end();
               } catch {}
             }
-          } catch {
-            // A failed member turn is a pass, not a room-wide failure.
+          } catch (error) {
+            memberTurnError = error;
           } finally {
             if (
               this.tm.runnerRegistry.activeGroupMemberRunners.get(
@@ -475,6 +478,22 @@ export class GroupChatGlue {
         );
       } catch {
         break;
+      }
+    }
+    if (memberTurnError != null && sent.length === 0) {
+      const notice: TranscriptEntry = {
+        kind: "notice",
+        id: `notice-group-member-${randomUUID()}`,
+        text: formatDeliveryNotice(
+          classifyErrorForDelivery(memberTurnError),
+          `${effective.member.name} could not take this turn: ${String(describeAgentRunError(memberTurnError).detail ?? (memberTurnError instanceof Error ? memberTurnError.message : String(memberTurnError)))}`,
+        ),
+        timestampMs: Date.now(),
+      };
+      if (this.tm.sessions.activeSession?.id === roomSession.id) this.tm.appendEntry(notice);
+      else {
+        roomSession.db.appendTranscriptEntry(notice);
+        void this.tm.roster.emitAgentUpdate(roomSession.id);
       }
     }
     return sent;

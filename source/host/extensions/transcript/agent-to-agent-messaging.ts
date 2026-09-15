@@ -1,4 +1,8 @@
 import {
+  classifyAgentSendFailure,
+  formatDeliveryNotice,
+} from "../../../shared/delivery-reasons.js";
+import {
   buildAgentInboundWakePrompt,
   clampAgentMessage,
 } from "../../agents/agent-messaging.js";
@@ -8,6 +12,7 @@ import { describeAgentRunError } from "./agent-run-error.js";
 import { loadAgentInboundImages } from "./send-message-shaping.js";
 import { nextEntryId } from "./transcript-entry-ids.js";
 import { getTranscript } from "./transcript-store.js";
+import { AgentGoneError } from "./session-runtime.js";
 import { classifyAgentError } from "./turn-runtime.js";
 import type { TranscriptManagerLike } from "./transcript-hub.js";
 
@@ -57,15 +62,26 @@ export class AgentToAgentMessaging {
     priority = false,
   ): Promise<string> {
     const message = clampAgentMessage(text);
-    if (message.length === 0) return "Message was empty; nothing was sent.";
-    if (toAgentId === fromAgentId) return "An agent can't message itself.";
-    if (this.tm.sessions.isAgentGone(toAgentId))
-      return "That agent no longer exists.";
-    if (this.tm.groupChat.isRemoteRoomAgentId(toAgentId))
-      return "That is a shared chat hosted by another user; agents can't message it directly.";
+    if (message.length === 0) {
+      return formatDeliveryNotice(classifyAgentSendFailure("empty"), "Message was empty; nothing was sent.");
+    }
+    if (toAgentId === fromAgentId) {
+      return formatDeliveryNotice(classifyAgentSendFailure("self"), "An agent can't message itself.");
+    }
+    if (this.tm.sessions.isAgentGone(toAgentId)) {
+      return formatDeliveryNotice(classifyAgentSendFailure("gone"), "That agent no longer exists.");
+    }
+    if (this.tm.groupChat.isRemoteRoomAgentId(toAgentId)) {
+      return formatDeliveryNotice(
+        classifyAgentSendFailure("remote-room"),
+        "That is a shared chat hosted by another user; agents can't message it directly.",
+      );
+    }
     const roster = await this.tm.sessionStore.listAgents();
     const target = roster.find((agent: any) => agent.id === toAgentId);
-    if (target == null) return `No agent found with id ${toAgentId}.`;
+    if (target == null) {
+      return formatDeliveryNotice(classifyAgentSendFailure("not-found"), `No agent found with id ${toAgentId}.`);
+    }
     if (target.isGroup) {
       const ack = await this.tm.postToGroup(
         fromAgentId,
@@ -116,6 +132,12 @@ export class AgentToAgentMessaging {
       queued.push(inbound);
       this.pendingAgentInbound.set(toAgentId, queued);
     }
+    const liveTarget = this.tm.sessions.liveSessions.get(toAgentId);
+    if (liveTarget != null) {
+      const displayed = { ...inbound, isDisplayed: true };
+      this.appendAgentInboundEntries(liveTarget, [displayed]);
+      Object.assign(inbound, { isDisplayed: true });
+    }
     void this.reviveForAgentInbound(toAgentId);
     return priority
       ? `Sent to ${target.name} as a priority message — it will interrupt their current non-user work and wake them now. This is asynchronous — if they reply, it'll arrive later as a new message that wakes you; don't wait on it now.`
@@ -159,7 +181,16 @@ export class AgentToAgentMessaging {
           this.pendingAgentInbound.get(agentId) ?? [],
         );
         this.pendingAgentInbound.delete(agentId);
-        await this.runAgentInboundWake(agentId, messages);
+        if (!(await this.runAgentInboundWake(agentId, messages))) {
+          this.pendingAgentInbound.set(
+            agentId,
+            mergeAgentInboundQueue(
+              this.pendingAgentInbound.get(agentId) ?? [],
+              messages,
+            ),
+          );
+          break;
+        }
       }
     } finally {
       this.revivingAgentInboundIds.delete(agentId);
@@ -169,19 +200,20 @@ export class AgentToAgentMessaging {
   async runAgentInboundWake(
     agentId: string,
     messages: readonly AgentInboundMessage[],
-  ): Promise<void> {
-    if (messages.length === 0 || !this.tm.execution.canExecute) return;
+  ): Promise<boolean> {
+    if (messages.length === 0) return true;
+    if (!this.tm.execution.canExecute) return false;
     let session: any;
     try {
       session = await this.tm.sessions.resolveBackgroundSession(agentId);
-    } catch {
-      return;
+    } catch (error) {
+      return error instanceof AgentGoneError || this.tm.sessions.isAgentGone(agentId);
     }
     if (
       this.tm.groupChat.isGroupSession(session) ||
       this.tm.groupChat.isRemoteRoomSession(session)
     )
-      return;
+      return true;
     this.appendAgentInboundEntries(
       session,
       messages.filter((message) => message.isDisplayed !== true),
@@ -270,6 +302,7 @@ export class AgentToAgentMessaging {
       },
       { lane: "agent", source: "agent" },
     );
+    return true;
   }
 
   appendAgentInboundEntries(

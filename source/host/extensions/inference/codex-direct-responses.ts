@@ -45,38 +45,70 @@ async function responseError(response: Response): Promise<Error> {
   return new Error(`Codex direct request failed (${response.status}${detail.length === 0 ? "" : `: ${detail}`}).`);
 }
 
+function nextSseBoundary(buffer: string): { readonly index: number; readonly size: number } | null {
+  const crlf = buffer.indexOf("\r\n\r\n");
+  const lf = buffer.indexOf("\n\n");
+  if (crlf === -1 && lf === -1) return null;
+  if (crlf === -1) return { index: lf, size: 2 };
+  if (lf === -1) return { index: crlf, size: 4 };
+  return crlf < lf ? { index: crlf, size: 4 } : { index: lf, size: 2 };
+}
+
+export function splitSseBlocks(buffer: string): { readonly blocks: string[]; readonly rest: string } {
+  const blocks: string[] = [];
+  let rest = buffer;
+  let boundary = nextSseBoundary(rest);
+  while (boundary != null) {
+    blocks.push(rest.slice(0, boundary.index).replaceAll("\r", ""));
+    rest = rest.slice(boundary.index + boundary.size);
+    boundary = nextSseBoundary(rest);
+  }
+  return { blocks, rest };
+}
+
 async function* sseEvents(response: Response): AsyncGenerator<Loose> {
   if (response.body == null) throw new Error("Codex direct response did not include a stream.");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    let boundary: number;
-    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
-      const block = buffer.slice(0, boundary).replaceAll("\r", "");
-      buffer = buffer.slice(boundary + 2);
-      const data = block.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
-      if (data.length === 0 || data === "[DONE]") continue;
-      let parsed: unknown;
-      try { parsed = JSON.parse(data); }
-      catch { throw new Error("Codex direct response contained malformed SSE JSON."); }
-      const event = record(parsed);
-      if (event != null) yield event;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const split = splitSseBlocks(buffer);
+      buffer = split.rest;
+      for (const block of split.blocks) {
+        const data = block.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
+        if (data.length === 0 || data === "[DONE]") continue;
+        let parsed: unknown;
+        try { parsed = JSON.parse(data); }
+        catch { throw new Error("Codex direct response contained malformed SSE JSON."); }
+        const event = record(parsed);
+        if (event != null) yield event;
+      }
+      if (done) break;
     }
-    if (done) break;
+    if (buffer.trim().length > 0 && buffer.trim() !== "data: [DONE]" && buffer.trim() !== "data: [DONE]\r") {
+      throw new Error("Codex direct response ended with an incomplete SSE event.");
+    }
+  } finally {
+    try { await reader.cancel(); } catch {}
+    try { reader.releaseLock(); } catch {}
   }
-  if (buffer.trim().length > 0 && buffer.trim() !== "data: [DONE]") throw new Error("Codex direct response ended with an incomplete SSE event.");
+}
+
+function finiteCount(value: unknown): number {
+  const count = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isFinite(count) && count >= 0 ? count : 0;
 }
 
 function usageOf(response: Loose): CodexDirectUsage {
   const usage = record(response.usage) ?? {};
   const details = record(usage.input_tokens_details) ?? {};
   return {
-    inputTokens: Number.isFinite(usage.input_tokens) ? usage.input_tokens : 0,
-    outputTokens: Number.isFinite(usage.output_tokens) ? usage.output_tokens : 0,
-    cacheReadTokens: Number.isFinite(details.cached_tokens) ? details.cached_tokens : 0,
+    inputTokens: finiteCount(usage.input_tokens),
+    outputTokens: finiteCount(usage.output_tokens),
+    cacheReadTokens: finiteCount(details.cached_tokens),
     cacheWriteTokens: 0,
   };
 }
@@ -177,7 +209,10 @@ export async function* streamCodexDirectResponses(options: CodexDirectOptions): 
         results.push({ type: "function_call_output", call_id: call.call_id, output: safeJson({ isError: true, error: error instanceof Error ? error.message : String(error) }) });
       }
     }
-    input = [...input, ...output.map(item => record(item) ?? {}), ...results];
+    input = [...input, ...output.flatMap(item => {
+      const row = record(item);
+      return row == null ? [] : [row];
+    }), ...results];
   }
   throw new Error(`Codex exceeded Grok Bot's ${maxSteps}-step tool limit.`);
 }

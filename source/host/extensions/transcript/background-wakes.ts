@@ -191,7 +191,13 @@ export class BackgroundWakes {
       while ((this.pendingInbound.get(agentId)?.length ?? 0) > 0) {
         const envelopes = this.pendingInbound.get(agentId) ?? [];
         this.pendingInbound.delete(agentId);
-        await this.runInboundWake(agentId, envelopes);
+        if (!(await this.runInboundWake(agentId, envelopes))) {
+          this.pendingInbound.set(agentId, [
+            ...envelopes,
+            ...(this.pendingInbound.get(agentId) ?? []),
+          ]);
+          break;
+        }
       }
     } finally {
       this.revivingInboundAgentIds.delete(agentId);
@@ -200,19 +206,20 @@ export class BackgroundWakes {
   async runInboundWake(
     agentId: string,
     envelopes: readonly any[],
-  ): Promise<void> {
-    if (envelopes.length === 0 || !this.tm.execution.canExecute) return;
+  ): Promise<boolean> {
+    if (envelopes.length === 0) return true;
+    if (!this.tm.execution.canExecute) return false;
     let session: any;
     try {
       session = await this.tm.sessions.resolveBackgroundSession(agentId);
-    } catch {
-      return;
+    } catch (error) {
+      return error instanceof AgentGoneError || this.tm.sessions.isAgentGone(agentId);
     }
     if (
       this.tm.groupChat.isGroupSession(session) ||
       this.tm.groupChat.isRemoteRoomSession(session)
     )
-      return;
+      return true;
     this.appendChannelInboundEntries(
       session,
       envelopes.filter((envelope) => envelope.isDisplayed !== true),
@@ -272,6 +279,7 @@ export class BackgroundWakes {
       },
       { lane: "background", source: "connector" },
     );
+    return true;
   }
   notifyChannelActivity(
     agentId: string,

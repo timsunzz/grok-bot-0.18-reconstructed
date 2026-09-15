@@ -86,6 +86,27 @@ test("direct Codex Responses transport executes Grok Bot tools and continues wit
   assert.deepEqual(events.at(-1), { type: "done", text: "Subject", responseId: "resp-final", usage: { inputTokens: 28, outputTokens: 6, cacheReadTokens: 6, cacheWriteTokens: 0 } });
 });
 
+test("direct Codex Responses transport reads CRLF-delimited SSE frames", async () => {
+  const { streamCodexDirectResponses } = await loadModule();
+  const events = [];
+  for await (const event of streamCodexDirectResponses({
+    fetch: async () => new Response(
+      `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "CRLF_" })}\r\n\r\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp-crlf", output: [{ type: "message", role: "assistant", content: [] }], usage: { input_tokens: "4", output_tokens: "1", input_tokens_details: { cached_tokens: "0" } } } })}\r\n\r\n`,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+    endpoint: "https://example.invalid/responses",
+    model: "gpt-test",
+    instructions: "Grok",
+    input: [{ role: "user", content: "hi" }],
+  })) events.push(event);
+  assert.deepEqual(events.at(-1), {
+    type: "done",
+    text: "CRLF_",
+    responseId: "resp-crlf",
+    usage: { inputTokens: 4, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+  });
+});
+
 test("direct Codex Responses transport fails closed on a truncated stream", async () => {
   const { streamCodexDirectResponses } = await loadModule();
   await assert.rejects(async () => {
