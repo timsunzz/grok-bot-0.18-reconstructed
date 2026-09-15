@@ -144,7 +144,10 @@ void composeCoordinator().catch((error) => {
 const localExecDaemonEntry = `
 import { runLocalExecDaemonEntrypoint } from "./source/local-exec-daemon/main.ts";
 
-void runLocalExecDaemonEntrypoint();
+void runLocalExecDaemonEntrypoint().catch((error) => {
+  process.stderr.write(\`sand-local-exec-daemon: startup failure: \${String(error)}\\n\`);
+  process.exit(1);
+});
 `;
 
 async function walkFiles(root, current = root) {

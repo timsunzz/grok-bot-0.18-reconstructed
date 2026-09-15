@@ -135,5 +135,12 @@ export async function runLocalExecDaemonEntrypoint(options: {
 
 const invokedPath = process.argv[1];
 if (invokedPath !== undefined && import.meta.url === pathToFileURL(invokedPath).href) {
-  void runLocalExecDaemonEntrypoint();
+  // The entrypoint reports its own fatals, but `reportLocalExecDaemonFatal` still rejects if
+  // `process.exit` does not terminate the process. Without a handler that surfaces as a bare
+  // unhandled rejection attributed to nothing, which is the one failure mode a daemon that is
+  // meant to be diagnosable cannot afford.
+  void runLocalExecDaemonEntrypoint().catch((error: unknown) => {
+    process.stderr.write(`sand-local-exec-daemon: startup failure: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    process.exit(1);
+  });
 }
