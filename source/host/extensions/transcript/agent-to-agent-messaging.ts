@@ -384,21 +384,26 @@ export class AgentToAgentMessaging {
       let persisted: boolean;
       if (isActive) {
         persisted = false;
-        this.tm.appendEntry(entry, {
-          persistBeforeEmit: true,
-          deferEmit: true,
-          onPersistOutcome: (isDurable: boolean) => {
-            persisted = isDurable;
-          },
-        });
-        if (persisted) this.tm.roster.emit({ type: "appended", entry });
-        else removeEntry(entry.id);
+        try {
+          this.tm.appendEntry(entry, {
+            persistBeforeEmit: true,
+            deferEmit: true,
+            onPersistOutcome: (isDurable: boolean) => {
+              persisted = isDurable;
+            },
+          });
+        } catch (error) {
+          removeEntry(entry.id);
+          throw error;
+        }
+        if (!persisted) removeEntry(entry.id);
       } else {
         persisted = session.db.appendTranscriptEntry(entry) !== false;
       }
       if (!persisted)
         throw new Error("Failed to persist an inbound agent message");
       message.isDisplayed = true;
+      if (isActive) this.tm.roster.emit({ type: "appended", entry });
     }
     if (!isActive) {
       if (raisesActivity) this.tm.sessionStore.markSessionActivity(session);

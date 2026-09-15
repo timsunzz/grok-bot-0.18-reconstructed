@@ -265,6 +265,29 @@ test("a rejected transcript append does not mark the message as displayed", asyn
     );
     assert.notEqual(activeMessage.isDisplayed, true);
     assert.equal(emitted, false);
+
+    const emitFailureMessage = { ...message, text: "durable before emit" };
+    const emitFailureMessaging = new loaded.module.AgentToAgentMessaging({
+      sessions: { activeSession: session },
+      sessionStore: { markSessionActivity: () => {} },
+      roster: {
+        emit: () => {
+          throw new Error("subscriber failed");
+        },
+        emitAgentUpdate: () => {},
+      },
+      appendEntry: (_entry, options) => {
+        options.onPersistOutcome(true);
+      },
+    });
+    assert.throws(
+      () =>
+        emitFailureMessaging.appendAgentInboundEntries(session, [
+          emitFailureMessage,
+        ]),
+      /subscriber failed/,
+    );
+    assert.equal(emitFailureMessage.isDisplayed, true);
   } finally {
     await loaded.dispose();
   }
