@@ -92,6 +92,10 @@ export function createMainEdgeHandlers(deps: MainEdgeDeps): HandlerMap {
     quitAndInstallUpdate: () => { invoke(updateService(deps), "quitAndInstall"); },
     setAutoUpdateWhenIdleOptIn: (raw) => invoke(updateService(deps), "setAutoUpdateWhenIdleOptIn", req(raw).enabled === true),
 
+    // These settings mirror to the box without waiting for it, as the shipped app does: they change
+    // how work is presented or which model a later turn picks, and the box re-reads them on
+    // reconnect. `setInferenceRouter` is the one that rolls back and reports, because a provider the
+    // box never heard about does not degrade the next turn, it sends it somewhere else entirely.
     getTimeZone: () => ({ detectedTimeZone: (deps.detectTimeZone ?? detectTimeZone)() ?? null, overrideTimeZone: invoke(deps.settingsStore, "getUserTimeZoneOverride") ?? null }),
     setTimeZoneOverride: (raw) => { const { timeZone } = req(raw); if (timeZone === null) invoke(deps.settingsStore, "setUserTimeZoneOverride", undefined); else if (typeof timeZone === "string" && isValidIanaTimeZone(timeZone)) invoke(deps.settingsStore, "setUserTimeZoneOverride", timeZone); const detected = (deps.detectTimeZone ?? detectTimeZone)(); void deps.syncHostSettingsToBox({ ...(detected == null ? {} : { userTimeZone: detected }), userTimeZoneOverride: invoke(deps.settingsStore, "getUserTimeZoneOverride") ?? "" }).catch((error: unknown) => reportDesktopEdgeFailure("host-settings", "time-zone", error)); return { detectedTimeZone: (deps.detectTimeZone ?? detectTimeZone)() ?? null, overrideTimeZone: invoke(deps.settingsStore, "getUserTimeZoneOverride") ?? null }; },
     getAutoReviewInstructions: () => invoke(deps.settingsStore, "getAutoReviewInstructions"),

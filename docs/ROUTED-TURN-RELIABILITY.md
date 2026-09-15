@@ -12,16 +12,28 @@ leans on.
 
 **Every failure carries a code.** `source/shared/routed-turn-failure.ts` holds a
 closed vocabulary of reasons. A failure is classified before it reaches a
-transcript and reported as `[reason: <code>] Router error: <original text>`, so
-the renderer and the retry gate branch on the code while the person still reads
-the provider's own sentence. Classification prefers what the provider client
-recorded — an HTTP status on the error — over what can be scraped out of prose,
-because prose gets reworded.
+transcript, stored as a `failureReason` field on the reply and reported as
+`[reason: <code>] Router error: <original text>`, so a surface can branch on the
+code without parsing prose while the person still reads the provider's own
+sentence. Classification prefers what the provider client recorded — an HTTP
+status on the error — over what can be scraped out of prose, because prose gets
+reworded.
 
-**A prompt runs once.** A resubmission carries the `clientNonce` of the
-submission it repeats; an identical `(nonce, prompt)` pair is acknowledged
-without running the turn again. A reused nonce carrying different text still
+**A prompt runs once, and a failed prompt can be sent again.** A resubmission
+carries the `clientNonce` of the submission it repeats; a prompt that has already
+been *answered* under that nonce is acknowledged without running the turn again.
+A prompt whose turn failed is not: resending it is how a person retries, and the
+desktop's resend reuses the nonce. A reused nonce carrying different text always
 runs, because dropping a real message is worse than an extra turn.
+
+**A turn ends.** Every routed provider request carries a deadline (ten minutes,
+covering tool steps), and it aborts the request rather than only abandoning it.
+Without one, a provider that stopped answering without closing its socket left
+the turn pending for the life of the process — and because the coordinator runs
+one routed turn per agent at a time, that turn swallowed every later prompt for
+that agent. The deadline is deliberately not an `AbortError` or `TimeoutError`,
+because those are how a cancelled turn arrives and a cancelled turn is never
+retried.
 
 **At most one retry, and only when a retry could change the answer.** Rate
 limits, server errors, unreachable providers and malformed streams are retried
@@ -40,12 +52,15 @@ way back may still have landed. The retry gate reads that mark alongside the
 reason, and the transcript says so, because the useful next step is checking what
 took effect rather than sending the same request again.
 
-**The provider sets the pace.** A refusal carrying `Retry-After` is honoured
-rather than guessed at; retrying before the reset only re-trips it. The wait is
-jittered so concurrent turns do not resynchronise on the same instant, and a wait
-longer than a foreground turn can hide (30s) fails with its reason instead of
-stalling behind a sleep nobody can see or cancel. `Retry-After: 0` is treated as
-absent so it cannot hot-loop the provider that just refused us.
+**The provider sets the pace, and only one layer retries.** A refusal carrying
+`Retry-After` is honoured rather than guessed at; retrying before the reset only
+re-trips it. The wait is jittered so concurrent turns do not resynchronise on the
+same instant, and a wait longer than a foreground turn can hide (30s) fails with
+its reason instead of stalling behind a sleep nobody can see or cancel.
+`Retry-After: 0` is treated as absent so it cannot hot-loop the provider that just
+refused us. The AI SDK's own two retries are turned off for routed turns, since
+they run back to back inside a single attempt, before any header is read, and
+would make one rate-limited turn cost six provider requests.
 
 **A broken plugin stops costing steps.** After three consecutive failures, a
 per-plugin breaker answers tool calls itself for a minute, then lets exactly one
@@ -123,3 +138,17 @@ logs, but line-oriented text, no metrics and no tracing across a topology that
 crosses two gateways and a relay. Grok Bot inherits OpenTelemetry from the
 shipped app, so the routed path's gap is narrower — but it is still worth saying
 that nothing above emits a span today.
+
+## What is still not guaranteed
+
+- A retried attempt has its own full deadline, so a turn that times out twice can
+  take twice as long before it reports. The bound exists; it is not tight.
+- The breaker's state lives in one turn's closure. A plugin that fails every call
+  is rediscovered by the next turn, which is deliberate — a person who fixes a
+  plugin should not have to wait out a cooldown — but it means the first few
+  calls of each turn can still be spent on a server that is down.
+- Read-only classification is inferred from a tool's name and description, not
+  declared by the plugin. A tool whose name reads like a query but writes is
+  treated as replayable.
+- Nothing here emits a span or a metric, so the retry, pacing and breaker
+  decisions are visible only in the transcript entry they produce.

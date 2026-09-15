@@ -1,3 +1,10 @@
+/**
+ * A telemetry-shaped record of an edge call that failed: where it happened and what class of error
+ * it was, deliberately without the message, which can carry a path or a token. Reporting here keeps
+ * a fire-and-forget promise from crashing Electron main on `unhandledRejection`; it does not tell
+ * the person anything, and before a reporter is installed at most `PRE_INSTALL_BUFFER_CAP` records
+ * are kept. A failure a person has to act on needs to reach them by another route.
+ */
 export interface DesktopEdgeFailure {
   readonly area: string;
   readonly leg: string;
