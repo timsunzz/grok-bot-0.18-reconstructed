@@ -8,7 +8,7 @@ export interface LocalInferenceCliStatus {
   readonly executablePath: string | null;
 }
 
-function isUserOwnedRegularFile(stats: { readonly isFile(): boolean; readonly uid: number; readonly mode: number }): boolean {
+function isUserOwnedRegularFile(stats: { isFile(): boolean; uid: number; mode: number }): boolean {
   if (!stats.isFile()) return false;
   if (typeof process.getuid === "function" && stats.uid !== process.getuid()) return false;
   return true;

@@ -106,6 +106,7 @@ test("sendPrompt validates input, canonicalizes nonce, and is idempotent", async
     let runs = 0;
     const settingsPath = path.join(temporary, "settings.json");
     await (await import("node:fs/promises")).writeFile(settingsPath, JSON.stringify({
+      version: 1,
       inferenceProvider: "codex",
     }));
     const router = loaded.module.createCoordinatorInferenceRouter({
@@ -149,6 +150,7 @@ test("failed routed turns keep streamed text on the same assistant id", async ()
   const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-router-fail-"));
   try {
     await (await import("node:fs/promises")).writeFile(path.join(temporary, "settings.json"), JSON.stringify({
+      version: 1,
       inferenceProvider: "codex",
     }));
     const router = loaded.module.createCoordinatorInferenceRouter({
@@ -180,7 +182,7 @@ test("a damaged transcript is not replaced by an empty store", async () => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "grok-router-corrupt-"));
   try {
     const { writeFile, readFile } = await import("node:fs/promises");
-    await writeFile(path.join(temporary, "settings.json"), JSON.stringify({ inferenceProvider: "codex" }));
+    await writeFile(path.join(temporary, "settings.json"), JSON.stringify({ version: 1, inferenceProvider: "codex" }));
     const storePath = path.join(temporary, "inference-router-transcript.json");
     await writeFile(storePath, "{not-json");
     const router = loaded.module.createCoordinatorInferenceRouter({
