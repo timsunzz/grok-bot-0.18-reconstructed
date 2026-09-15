@@ -243,6 +243,28 @@ test("a rejected transcript append does not mark the message as displayed", asyn
       /Failed to persist/,
     );
     assert.notEqual(message.isDisplayed, true);
+
+    const activeMessage = { ...message, text: "persist active" };
+    let emitted = false;
+    const activeMessaging = new loaded.module.AgentToAgentMessaging({
+      sessions: { activeSession: session },
+      sessionStore: { markSessionActivity: () => {} },
+      roster: {
+        emit: () => {
+          emitted = true;
+        },
+        emitAgentUpdate: () => {},
+      },
+      appendEntry: (_entry, options) => {
+        options.onPersistOutcome(false);
+      },
+    });
+    assert.throws(
+      () => activeMessaging.appendAgentInboundEntries(session, [activeMessage]),
+      /Failed to persist/,
+    );
+    assert.notEqual(activeMessage.isDisplayed, true);
+    assert.equal(emitted, false);
   } finally {
     await loaded.dispose();
   }

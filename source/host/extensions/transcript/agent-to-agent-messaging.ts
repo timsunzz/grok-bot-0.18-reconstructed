@@ -8,7 +8,7 @@ import { describeAgentRunError } from "./agent-run-error.js";
 import { loadAgentInboundImages } from "./send-message-shaping.js";
 import { AgentGoneError } from "./session-runtime.js";
 import { nextEntryId } from "./transcript-entry-ids.js";
-import { getTranscript } from "./transcript-store.js";
+import { getTranscript, removeEntry } from "./transcript-store.js";
 import { classifyAgentError } from "./turn-runtime.js";
 import type { TranscriptManagerLike } from "./transcript-hub.js";
 
@@ -381,10 +381,22 @@ export class AgentToAgentMessaging {
         ...(message.images?.length ? { images: message.images } : {}),
       };
       raisesActivity ||= entryRaisesUserActivitySignal(entry);
-      const appended = isActive
-        ? this.tm.appendEntry(entry)
-        : session.db.appendTranscriptEntry(entry);
-      if (appended === false)
+      let persisted: boolean;
+      if (isActive) {
+        persisted = false;
+        this.tm.appendEntry(entry, {
+          persistBeforeEmit: true,
+          deferEmit: true,
+          onPersistOutcome: (isDurable: boolean) => {
+            persisted = isDurable;
+          },
+        });
+        if (persisted) this.tm.roster.emit({ type: "appended", entry });
+        else removeEntry(entry.id);
+      } else {
+        persisted = session.db.appendTranscriptEntry(entry) !== false;
+      }
+      if (!persisted)
         throw new Error("Failed to persist an inbound agent message");
       message.isDisplayed = true;
     }
