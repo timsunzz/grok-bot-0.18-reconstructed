@@ -34,12 +34,25 @@ answering without closing its socket left the turn pending for the life of the
 process — and because the coordinator runs one routed turn per agent at a time,
 that turn swallowed every later prompt for that agent. A total-duration cap would
 have traded that for a new failure, since a turn that reasons at length and then
-works through eight tool steps is working. So anything the provider sends resets
-the window, down to a reasoning delta the transports otherwise keep to
-themselves, and so does a plugin call running on the provider's behalf. The same
-deadline covers the host's own agent turns, not just the coordinator's routed
-ones. It is deliberately not an `AbortError` or `TimeoutError`, because those are
-how a cancelled turn arrives and a cancelled turn is never retried.
+works through eight tool steps is working.
+
+So the window covers one thing only: time the turn spends blocked on the provider.
+Anything the provider sends restarts it, down to a reasoning delta the transports
+otherwise keep to themselves. A plugin call takes it out of the reckoning entirely
+for as long as the call runs, since a plugin reading a large mailbox or waiting on
+an OAuth refresh will outlast three minutes and is not the provider stalling; the
+call carries a bound of its own instead (two minutes,
+`SAND_ROUTED_TOOL_TIMEOUT_MS`), and reaching it ends the call rather than the turn.
+Neither does time a consumer spends on a part it has already been handed count.
+Being armed only for that interval is also what keeps a turn that never started —
+one refused for a missing key, or a stream nobody read — from leaving a timer
+behind.
+
+The same deadline covers the host's own agent turns, not just the coordinator's
+routed ones, and a stream dropped before it ended cancels its request the same way
+a deadline does: nothing is reading it, and it belongs to that one turn. The error
+is deliberately not an `AbortError` or `TimeoutError`, because those are how a
+cancelled turn arrives and a cancelled turn is never retried.
 
 **At most one retry, and only when a retry could change the answer.** Rate
 limits, server errors, unreachable providers and malformed streams are retried
@@ -151,7 +164,8 @@ that nothing above emits a span today.
 
 - Nothing bounds a turn's total duration, only its silences, and the retried
   attempt gets a fresh window of its own. A provider that keeps talking without
-  finishing is not something this stops.
+  finishing is not something this stops. A plugin call is bounded separately, and
+  eight of them plus the provider's own thinking can still add up to a long turn.
 - The breaker's state lives in one turn's closure. A plugin that fails every call
   is rediscovered by the next turn, which is deliberate — a person who fixes a
   plugin should not have to wait out a cooldown — but it means the first few

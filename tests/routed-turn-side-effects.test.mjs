@@ -137,6 +137,37 @@ test("a turn that only read still gets its retry", { timeout: 90_000 }, async ()
   }
 });
 
+test("a plugin that never answers loses its call, not the turn", { timeout: 90_000 }, async () => {
+  const loaded = await loadRouter();
+  process.env.SAND_ROUTED_TOOL_TIMEOUT_MS = "300";
+  try {
+    await seed(loaded.dataDir);
+    const { router } = harness(loaded.dataDir, loaded.module, [READ_TOOL], () => new Promise(() => {}));
+
+    let failure = null;
+    globalThis.__routedProviderStub = async (_provider, _messages, options) => {
+      // Every transport turns a throwing tool call into a failed tool result for the model, so this
+      // stands in for what the model is handed.
+      try { await options.executeTool(READ_TOOL, {}, "call-0"); }
+      catch (error) { failure = error; }
+      return "the plugin never came back";
+    };
+
+    await router.dispatch("sendPrompt", { agentId: "agent-hung-plugin", prompt: "search", clientNonce: "n4" });
+    const entry = await assistantEntry(loaded.dataDir, "agent-hung-plugin");
+
+    // A plugin call suspends the turn's silence deadline, because the provider is quiet while a tool
+    // runs and a slow plugin is the turn working. Nothing else bounded the call, so a plugin that
+    // never answered held the turn — and every later prompt for that agent — for good.
+    assert.match(failure?.message ?? "", /search_email did not answer within/);
+    assert.equal(entry.content, "the plugin never came back");
+  } finally {
+    delete process.env.SAND_ROUTED_TOOL_TIMEOUT_MS;
+    delete globalThis.__routedProviderStub;
+    await loaded.dispose();
+  }
+});
+
 test("a plugin failing every call stops being dispatched to", { timeout: 90_000 }, async () => {
   const loaded = await loadRouter();
   try {

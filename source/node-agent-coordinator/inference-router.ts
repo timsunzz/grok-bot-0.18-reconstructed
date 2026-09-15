@@ -12,6 +12,36 @@ import { createRoutedToolBreaker } from "./routed-tool-breaker.js";
 
 const TURN_ID_PATTERN = /^t(\d+)(?:u|s\d+)$/;
 
+/**
+ * How long one plugin call may take. A call suspends the routed turn's silence deadline for as long
+ * as it runs — the provider says nothing while a tool works, and a plugin reading a large mailbox or
+ * waiting on an OAuth refresh legitimately outlasts that window — so something else has to bound it,
+ * or a plugin that never answers holds the turn, and with it every later prompt for that agent, for
+ * the life of the process.
+ *
+ * It ends the call rather than the turn. Every transport hands the model a failed tool result and
+ * lets it answer around it, which is what it already does for a plugin that refuses.
+ */
+const ROUTED_TOOL_CALL_TIMEOUT_MS = 120_000;
+
+function toolCallTimeoutMs(): number {
+  const configured = Number(process.env.SAND_ROUTED_TOOL_TIMEOUT_MS?.trim());
+  return Number.isFinite(configured) && configured > 0 ? configured : ROUTED_TOOL_CALL_TIMEOUT_MS;
+}
+
+async function withinToolCallDeadline<T>(work: Promise<T>, description: string): Promise<T> {
+  const timeoutMs = toolCallTimeoutMs();
+  // Nothing here can cancel the call itself: the control-command dispatch takes no signal. What is
+  // abandoned is the wait, so the abandoned promise needs a handler of its own.
+  work.catch(() => {});
+  const { promise, reject } = Promise.withResolvers<never>();
+  promise.catch(() => {});
+  const timer = setTimeout(() => reject(new Error(`${description} did not answer within ${Math.round(timeoutMs / 1_000)}s.`)), timeoutMs);
+  timer.unref();
+  try { return await Promise.race([work, promise]); }
+  finally { clearTimeout(timer); }
+}
+
 type StoredEntry = {
   readonly provider: Exclude<SandInferenceProvider, "cursor">;
   readonly role: "user" | "assistant";
@@ -223,14 +253,14 @@ export function createCoordinatorInferenceRouter(options: {
         if (!routedToolIsReadOnly(definition)) appliedWriteEffect = true;
         let value: unknown;
         try {
-          value = await options.dispatchRemote("executeRoutedMcpTool", {
+          value = await withinToolCallDeadline(options.dispatchRemote("executeRoutedMcpTool", {
             providerIdentifier: definition.providerIdentifier,
             name: definition.name,
             toolName: definition.toolName,
             args: toolArgs,
             toolCallId,
             agentId,
-          });
+          }), typeof definition.name === "string" && definition.name.length > 0 ? definition.name : "That plugin");
         } catch (error) { breaker.recordFailure(server, "unreachable"); throw error; }
         if (routedToolCallFailed(value)) breaker.recordFailure(server, "rejected");
         else breaker.recordSuccess(server);
