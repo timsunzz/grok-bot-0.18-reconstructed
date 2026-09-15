@@ -6,6 +6,7 @@ import { query as queryClaude, type SDKResultMessage } from "@anthropic-ai/claud
 import { createOpenAI } from "@ai-sdk/openai";
 import { jsonSchema, streamText, tool, type CoreMessage, type LanguageModelV1, type ToolSet } from "ai";
 
+import { createRealIdleWatchdogPolicy } from "../../../internal/scheduling.js";
 import { BasePromptBuilder, BasePromptExecutor } from "../../../packages/chat-inference/base.js";
 import type { SandInferenceProvider } from "../../../shared/inference-router.js";
 import { resolveClaudeCodeCliPath } from "../../../shared/node/inference-router-local.js";
@@ -94,16 +95,15 @@ function observed<T>(promise: Promise<T>): Promise<T> {
 }
 
 /**
- * A provider that stops answering without closing its socket used to leave a routed turn pending for
- * the life of the process. The coordinator runs one routed turn per agent at a time, so that single
- * turn silently swallowed every later prompt for that agent while the activity row kept pulsing.
+ * How long a routed turn may hear nothing at all from its provider. A provider that stops answering
+ * without closing its socket leaves the turn pending, and the coordinator runs one routed turn per
+ * agent at a time, so a single such turn swallows every later prompt for that agent.
  *
- * What is bounded is silence, not duration. A turn that reasons for a while and then works through
- * eight tool steps is working, however long it takes, and cutting it off at a total would be a new
- * bug rather than a fix for this one. Anything the provider sends resets the window, down to a
- * reasoning delta, and so does a tool call running on the provider's behalf.
+ * What is bounded is silence, not duration: a turn that reasons at length and then works through
+ * eight tool steps is working, however long it takes. Anything the provider sends resets the window,
+ * down to a reasoning delta, and work running on the provider's behalf suspends it entirely.
  */
-export const ROUTED_TURN_IDLE_TIMEOUT_MS = 180_000;
+const ROUTED_TURN_IDLE_TIMEOUT_MS = 180_000;
 
 // Three minutes of silence is a stalled provider for every model this app routes to today, but that
 // is a judgement about providers, not a fact about them, so it is adjustable in the same way the
@@ -113,43 +113,83 @@ function configuredIdleTimeoutMs(): number {
   return Number.isFinite(configured) && configured > 0 ? configured : ROUTED_TURN_IDLE_TIMEOUT_MS;
 }
 
+function silenceDuration(idleTimeoutMs: number): string {
+  return idleTimeoutMs < 1_000 ? `${Math.round(idleTimeoutMs)}ms` : `${Math.round(idleTimeoutMs / 1_000)}s`;
+}
+
 function routedTimeoutError(provider: RoutedProvider, idleTimeoutMs: number): Error {
-  const error = new Error(`${provider} stopped responding: Grok Bot gave up on this turn after ${Math.round(idleTimeoutMs / 1_000)}s of silence.`);
+  const error = new Error(`${provider} stopped responding: Grok Bot gave up on this turn after ${silenceDuration(idleTimeoutMs)} of silence.`);
   // Deliberately not `AbortError` or `TimeoutError`. Those are how a cancelled turn arrives, and a
   // cancelled turn is never retried; this is the transient case the retry exists for.
   error.name = ROUTED_TURN_TIMEOUT_ERROR_NAME;
   return error;
 }
 
-type RoutedIdleWatchdog = { readonly expired: Promise<never>; bump(): void; awaitingProvider(waiting: boolean): void; stop(): void };
+type RoutedToolGate = <T>(work: () => Promise<T>) => Promise<T>;
+type RoutedIdleWatchdog = {
+  readonly expired: Promise<never>;
+  /** The provider said something. Restarts the window if one is open. */
+  bump(): void;
+  /** Whether the turn is now blocked on the provider, which is the only state the window runs in. */
+  awaitingProvider(waiting: boolean): void;
+  /** Runs work of ours — a plugin call — with the window suspended for its duration. */
+  whileWorking: RoutedToolGate;
+  /** Called when the stream is dropped before it ended, so the request behind it is closed. */
+  abandoned(): void;
+  stop(): void;
+};
 
 function routedIdleWatchdog(provider: RoutedProvider, runtime: RoutedRuntime): RoutedIdleWatchdog | null {
-  const idleTimeoutMs = runtime.idleTimeoutMs ?? 0;
+  const idleMs = runtime.idleTimeoutMs ?? 0;
   const controller = runtime.abortController;
   // With nothing to cancel there is no deadline worth having: abandoning the turn while its request
   // stays open is the leak this set out to close.
-  if (controller == null || !(idleTimeoutMs > 0)) return null;
+  if (controller == null || !(idleMs > 0)) return null;
   const { promise, reject } = Promise.withResolvers<never>();
   promise.catch(() => {});
-  // Only time spent waiting on the provider counts. Whatever the consumer does with a part it has
-  // already been handed is its own business, and cancelling a healthy request because the reader
-  // was busy would be a worse bug than the one this fixes.
-  let waitingSinceMs: number | null = null;
-  const timer = setInterval(() => {
-    if (waitingSinceMs == null || Date.now() - waitingSinceMs < idleTimeoutMs) return;
-    clearInterval(timer);
-    const error = routedTimeoutError(provider, idleTimeoutMs);
+  const policy = createRealIdleWatchdogPolicy({ name: `routed-turn-${provider}`, idleMs });
+  let armed: { kick(): void; dispose(): void } | null = null;
+  let waiting = false;
+  let working = 0;
+  let done = false;
+  const disarm = (): void => { armed?.dispose(); armed = null; };
+  const stop = (): void => { done = true; disarm(); };
+  const expire = (): void => {
+    stop();
+    const error = routedTimeoutError(provider, idleMs);
     // Aborted so the provider request is closed, and rejected so the caller hears the deadline
     // rather than whatever shape the abort takes on its way back out of the provider client.
     controller.abort(error);
     reject(error);
-  }, Math.max(250, Math.min(idleTimeoutMs, 5_000)));
-  timer.unref();
+  };
+  /**
+   * The window is open only while the turn is blocked on the provider with nothing of its own
+   * running. Two things follow from arming it here rather than at construction: a turn that throws
+   * while validating its credentials, and a stream nobody ever iterates, both leave no timer behind.
+   * And time the consumer spends on a part it has already been handed does not count, nor does a
+   * plugin call — cancelling a healthy request because the reader or a tool was slow would be a
+   * worse bug than the one this closes.
+   */
+  const settle = (): void => {
+    if (done) return;
+    const open = waiting && working === 0;
+    if (open === (armed != null)) { armed?.kick(); return; }
+    if (open) armed = policy.arm(expire);
+    else disarm();
+  };
   return {
     expired: promise,
-    bump: () => { if (waitingSinceMs != null) waitingSinceMs = Date.now(); },
-    awaitingProvider: (waiting) => { waitingSinceMs = waiting ? Date.now() : null; },
-    stop: () => clearInterval(timer),
+    bump: () => armed?.kick(),
+    awaitingProvider: (next) => { waiting = next; settle(); },
+    whileWorking: async (work) => {
+      working += 1;
+      settle();
+      try { return await work(); }
+      finally { working -= 1; settle(); }
+    },
+    // The request is this turn's alone, and nothing is reading it any more.
+    abandoned: () => controller.abort(routedTimeoutError(provider, idleMs)),
+    stop,
   };
 }
 
@@ -159,6 +199,7 @@ function whileAnswering<T>(source: AsyncIterable<T>, watchdog: RoutedIdleWatchdo
 
 async function* guarded<T>(source: AsyncIterable<T>, watchdog: RoutedIdleWatchdog): AsyncGenerator<T> {
   const iterator = source[Symbol.asyncIterator]();
+  let ended = false;
   try {
     for (;;) {
       const step = iterator.next();
@@ -167,16 +208,17 @@ async function* guarded<T>(source: AsyncIterable<T>, watchdog: RoutedIdleWatchdo
       watchdog.awaitingProvider(true);
       const result = await Promise.race([step, watchdog.expired]);
       watchdog.awaitingProvider(false);
-      if (result.done === true) return;
+      if (result.done === true) { ended = true; return; }
       yield result.value;
     }
   } finally {
     watchdog.stop();
-    // Whether the deadline fired or the consumer stopped reading, the stream being dropped here is
-    // attached to a live request, so it is asked to wind down. Deliberately not awaited: a generator
-    // suspended on a provider that has gone quiet cannot resume until that request settles, and
-    // waiting for it is precisely what this deadline exists to avoid. The abort is what closes the
-    // request; this only releases the stream once it can be released.
+    // A stream dropped before it ended is a request nobody is reading, whether the deadline fired or
+    // the consumer walked away, so it is cancelled. A stream that ended is not: its request is
+    // already closed, and the caller still has `response` and `usage` to await.
+    if (!ended) watchdog.abandoned();
+    // Deliberately not awaited. A generator suspended on a provider that has gone quiet cannot
+    // resume until that request settles, and waiting for it is what the abort above avoids.
     const wound = iterator.return?.();
     wound?.catch(() => {});
   }
@@ -317,10 +359,12 @@ function codexExecutor(messages: readonly ProviderMessage[], invocationId: strin
         // what it hears — reasoning deltas included — to the deadline directly. Otherwise a model
         // thinking out loud for a few minutes looks exactly like one that has stopped.
         ...(watchdog == null ? {} : { onActivity: watchdog.bump }),
+        // A plugin call is the turn working, and the provider says nothing while one runs. Bumping
+        // the window would only buy the call the same three minutes the provider gets; suspending it
+        // is what lets a slow plugin finish.
         ...(executeTool == null ? {} : { executeTool: async (selected, args, toolCallId) => {
-          watchdog?.bump();
-          try { return await executeTool(selected.source, args, toolCallId); }
-          finally { watchdog?.bump(); }
+          const call = () => executeTool(selected.source, args, toolCallId);
+          return watchdog == null ? await call() : await watchdog.whileWorking(call);
         } }),
         ...(runtime.signal == null ? {} : { signal: runtime.signal }),
         maxSteps: tools == null ? 1 : 8,
@@ -341,9 +385,9 @@ function codexExecutor(messages: readonly ProviderMessage[], invocationId: strin
 }
 
 function claudeExecutor(messages: readonly ProviderMessage[], invocationId: string, onUsage?: (usage: UsageRecord) => void, mcpServerUrl?: string, runtime: RoutedRuntime = {}) {
-  const watchdog = routedIdleWatchdog("claude-code", runtime);
   const executable = resolveClaudeCodeCliPath();
   if (executable == null) throw new Error("Claude Code is not installed. Install and sign in to Claude Code, then reopen Grok Bot.");
+  const watchdog = routedIdleWatchdog("claude-code", runtime);
   const usage = deferred<{ promptTokens: number; completionTokens: number; totalTokens: number }>();
   const extendedUsage = deferred<{ inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; maxTokens: number }>();
   const resultResponse = deferred<ReturnType<typeof response>>();
@@ -377,7 +421,7 @@ function claudeExecutor(messages: readonly ProviderMessage[], invocationId: stri
   return { fullStream: whileAnswering(fullStream, watchdog), response: resultResponse.promise, usage: usage.promise, extendedUsage: extendedUsage.promise, providerMetadata: metadata.promise, invocationId: Promise.resolve(invocationId) };
 }
 
-function toToolSet(definitions: readonly Loose[] | undefined, executeTool?: RoutedToolExecutor, onActivity?: () => void): ToolSet | undefined {
+function toToolSet(definitions: readonly Loose[] | undefined, executeTool?: RoutedToolExecutor, whileWorking?: RoutedToolGate): ToolSet | undefined {
   if (definitions == null || definitions.length === 0) return undefined;
   const tools: ToolSet = {};
   for (const definition of definitions) {
@@ -393,11 +437,13 @@ function toToolSet(definitions: readonly Loose[] | undefined, executeTool?: Rout
     // a turn: the Codex transport and the Claude Code bridge both hand the model an `isError`
     // result and let it carry on, so this one does too.
     if (executeTool != null) routedTool.execute = async (args: unknown, options: { toolCallId: string }) => {
-      // The SDK emits nothing while a tool runs, and a plugin call is the turn making progress.
-      onActivity?.();
-      try { return await executeTool(definition, args, options.toolCallId); }
-      catch (error) { return { isError: true, error: error instanceof Error ? error.message : String(error) }; }
-      finally { onActivity?.(); }
+      // The SDK emits nothing while a tool runs, so the deadline has to be told that the silence is
+      // the turn working rather than the provider stalling.
+      const call = async (): Promise<unknown> => {
+        try { return await executeTool(definition, args, options.toolCallId); }
+        catch (error) { return { isError: true, error: error instanceof Error ? error.message : String(error) }; }
+      };
+      return whileWorking == null ? await call() : await whileWorking(call);
     };
     tools[definition.name] = tool(routedTool);
   }
@@ -406,9 +452,9 @@ function toToolSet(definitions: readonly Loose[] | undefined, executeTool?: Rout
 
 function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, runtime: RoutedRuntime = {}) {
   const id = process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
-  const watchdog = routedIdleWatchdog("openrouter", runtime);
   const model: LanguageModelV1 = createOpenAI({ apiKey: openRouterCredential(), baseURL: "https://openrouter.ai/api/v1", compatibility: "compatible", name: "openrouter", headers: { "HTTP-Referer": "https://github.com/grok-bot-reconstructed", "X-Title": "Grok Bot Reconstructed" } }).chat(id as any);
-  const tools = toToolSet(definitions, executeTool, watchdog?.bump);
+  const watchdog = routedIdleWatchdog("openrouter", runtime);
+  const tools = toToolSet(definitions, executeTool, watchdog?.whileWorking);
   // `maxRetries` is the caller's to set. The AI SDK retries 429s and 5xx twice of its own accord,
   // and a routed turn has its own retry that paces itself from `Retry-After`; leaving both on
   // spends up to six provider requests on one rate-limited turn, three of them back to back

@@ -109,13 +109,9 @@ test("abandoning a routed stream settles its side channels instead of hanging", 
   try {
     // A stream that delivers one delta and then never completes, standing in for a turn the
     // consumer abandons part-way through.
-    const stalled = () => sse(new ReadableStream({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"partial"}\n\n'));
-      },
-    }));
+    const stalled = goesQuiet({ type: "response.output_text.delta", delta: "partial" });
 
-    const observed = await withoutUnhandledRejections(() => withStubbedFetch(async () => stalled(), async () => {
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(stalled, async () => {
       const session = loaded.module.createProviderPromptSession("codex");
       const result = session.getExecutor().stream(undefined, "invocation-1");
       const iterator = result.fullStream[Symbol.asyncIterator]();
@@ -128,6 +124,10 @@ test("abandoning a routed stream settles its side channels instead of hanging", 
       }
     }));
 
+    // Settling the channels only frees whoever was awaiting them. The request behind the stream is
+    // this turn's alone and nothing is reading it any more, so walking away has to close it too —
+    // otherwise an abandoned turn leaves its provider request open for the life of the process.
+    assert.equal(stalled.aborted, true);
     assert.deepEqual(observed, []);
   } finally {
     await loaded.dispose();
@@ -135,15 +135,36 @@ test("abandoning a routed stream settles its side channels instead of hanging", 
 });
 
 // A response that opens its stream, sends whatever it is given, and then says nothing more. The
-// socket stays up, so no network error ever arrives.
+// socket stays up, so no network error ever arrives. Each stub carries its own view of the request
+// it was handed, so two tests cannot read each other's.
 function goesQuiet(...events) {
-  return (_url, init) => {
-    goesQuiet.signal = init.signal;
+  let signal = null;
+  const stub = (_url, init) => {
+    signal = init?.signal ?? null;
     return Promise.resolve(sse(new ReadableStream({
       start(controller) {
         for (const event of events) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
       },
     })));
+  };
+  return Object.defineProperty(stub, "aborted", { get: () => signal?.aborted === true });
+}
+
+// Timers this app creates are unref'd, so a leaked one is invisible to `getActiveResourcesInfo`.
+// Counting them is the only way to see it.
+function trackTimers() {
+  const real = { setInterval: globalThis.setInterval, clearInterval: globalThis.clearInterval, setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout };
+  const live = new Set();
+  globalThis.setInterval = (...args) => { const timer = real.setInterval(...args); live.add(timer); return timer; };
+  globalThis.setTimeout = (...args) => { const timer = real.setTimeout(...args); live.add(timer); return timer; };
+  globalThis.clearInterval = (timer) => { live.delete(timer); return real.clearInterval(timer); };
+  globalThis.clearTimeout = (timer) => { live.delete(timer); return real.clearTimeout(timer); };
+  return {
+    outstanding: () => live.size,
+    stop: () => {
+      Object.assign(globalThis, real);
+      for (const timer of live) real.clearInterval(timer);
+    },
   };
 }
 
@@ -154,7 +175,8 @@ test("a provider that stops responding loses its turn instead of holding the que
     // silently swallows every later prompt for that agent.
     const started = Date.now();
     let failure = null;
-    const observed = await withoutUnhandledRejections(() => withStubbedFetch(goesQuiet(), async () => {
+    const quiet = goesQuiet();
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(quiet, async () => {
       await assert.rejects(
         loaded.module.runRoutedProviderText("codex", [{ role: "user", content: "hi" }], { idleTimeoutMs: 500 }),
         (error) => { failure = error; return true; },
@@ -164,7 +186,7 @@ test("a provider that stops responding loses its turn instead of holding the que
     assert.ok(Date.now() - started < 10_000, `gave up after ${Date.now() - started}ms`);
     assert.match(failure.message, /stopped responding/);
     // The provider request has to be closed too, or the turn is abandoned while its socket is not.
-    assert.equal(goesQuiet.signal.aborted, true);
+    assert.equal(quiet.aborted, true);
     // `AbortError` and `TimeoutError` are how a person cancelling a turn arrives, and a cancelled
     // turn is deliberately not retried. A deadline this app imposed is the transient case the
     // retry exists for, so it must not be mistaken for one.
@@ -218,7 +240,8 @@ test("the host's own agent turns get the same deadline", { timeout: 30_000 }, as
     process.env.SAND_ROUTED_IDLE_TIMEOUT_MS = "500";
     const started = Date.now();
     let failure = null;
-    const observed = await withoutUnhandledRejections(() => withStubbedFetch(goesQuiet({ type: "response.output_text.delta", delta: "half an ans" }), async () => {
+    const quiet = goesQuiet({ type: "response.output_text.delta", delta: "half an ans" });
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(quiet, async () => {
       const session = loaded.module.createProviderPromptSession("codex");
       const result = session.getExecutor().stream(undefined, "invocation-1");
       await assert.rejects(async () => {
@@ -228,7 +251,7 @@ test("the host's own agent turns get the same deadline", { timeout: 30_000 }, as
 
     assert.ok(Date.now() - started < 10_000, `gave up after ${Date.now() - started}ms`);
     assert.equal(failure.name, "RoutedTurnTimeoutError");
-    assert.equal(goesQuiet.signal.aborted, true);
+    assert.equal(quiet.aborted, true);
     assert.deepEqual(observed, []);
   } finally {
     delete process.env.SAND_ROUTED_IDLE_TIMEOUT_MS;
@@ -264,6 +287,61 @@ test("a reader taking its time is not a provider going quiet", { timeout: 30_000
     assert.deepEqual(observed, []);
   } finally {
     delete process.env.SAND_ROUTED_IDLE_TIMEOUT_MS;
+    await loaded.dispose();
+  }
+});
+
+test("a plugin slower than the deadline is the turn working, not the provider stalling", { timeout: 30_000 }, async () => {
+  const loaded = await loadProviderSession();
+  process.env.OPENROUTER_API_KEY = "test-key";
+  try {
+    // The provider says nothing at all while a plugin call runs, so the silence a plugin creates is
+    // the silence the deadline watches for. Resetting the window when the call starts only gives the
+    // plugin the same window the provider gets, and a plugin that reads a large mailbox or waits on
+    // an OAuth refresh outlasts it — the turn was then cancelled for making progress.
+    let bodies = 0;
+    let answer = null;
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(async () => {
+      bodies += 1;
+      return bodies === 1
+        ? completion([[{ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "gmail_search", arguments: "{}" } }] }], [{}, "tool_calls"]])
+        : completion([[{ content: "Two unread." }], [{}, "stop"]]);
+    }, async () => {
+      answer = await loaded.module.runRoutedProviderText("openrouter", [{ role: "user", content: "any mail?" }], {
+        idleTimeoutMs: 300,
+        tools: [{ name: "gmail_search", description: "Search Gmail", inputSchema: { type: "object", properties: {} } }],
+        executeTool: async () => { await new Promise((resolve) => setTimeout(resolve, 1_200)); return { count: 2 }; },
+      });
+    }));
+
+    assert.equal(answer, "Two unread.");
+    assert.equal(bodies, 2);
+    assert.deepEqual(observed, []);
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+    await loaded.dispose();
+  }
+});
+
+test("a turn that never starts leaves no deadline running", { timeout: 30_000 }, async () => {
+  const loaded = await loadProviderSession();
+  delete process.env.OPENROUTER_API_KEY;
+  try {
+    // Two of the three transports validate their credentials after the point the deadline used to be
+    // armed, so every turn refused for a missing key left a repeating timer behind — unref'd, and so
+    // invisible to anything but a count. A stream nobody iterates leaked the same way, since the
+    // clause that disposes the timer is in the stream.
+    const session = loaded.module.createProviderPromptSession("openrouter");
+    const ledger = trackTimers();
+    try {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        assert.throws(() => session.getExecutor().stream(undefined, `invocation-${attempt}`), /OPENROUTER_API_KEY/);
+      }
+      assert.equal(ledger.outstanding(), 0, `${ledger.outstanding()} timers outlived turns that never ran`);
+    } finally {
+      ledger.stop();
+    }
+  } finally {
     await loaded.dispose();
   }
 });
