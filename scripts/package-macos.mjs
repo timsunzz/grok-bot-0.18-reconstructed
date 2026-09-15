@@ -10,11 +10,9 @@ import { buildFidelityReconstructedAsar } from "./clean-build.mjs";
 import { signAppBundleAdHoc } from "./lib/codesign.mjs";
 import { verifyOfficialMacReference, verifyReconstructedMacPackage } from "./lib/macos-package-verification.mjs";
 import { run } from "./lib/process.mjs";
-import { SYSTEM_TOOLS } from "./lib/system-tools.mjs";
+import { SYSTEM_TOOLS, assertMacOsHost } from "./lib/system-tools.mjs";
 
-if (process.platform !== "darwin") {
-  throw new Error("The reconstructed macOS application can only be packaged on macOS.");
-}
+assertMacOsHost("Packaging the reconstructed macOS application");
 
 // Keep the checksum-pinned shipped renderer as the polished UI authority. Small
 // reconstructed UI extensions are installed by the clean preload, leaving the

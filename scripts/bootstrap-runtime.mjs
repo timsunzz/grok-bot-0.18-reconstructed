@@ -8,7 +8,11 @@ import { Readable } from "node:stream";
 import { archivedDmg, cachedDmg, cachedRuntimeApp, dmgSha256, dmgUrl } from "./lib/config.mjs";
 import { run } from "./lib/process.mjs";
 import { cacheRuntimeFromApp, hydrateSourcePayloadFromRuntime, validateRuntimeApp } from "./lib/runtime.mjs";
-import { SYSTEM_TOOLS } from "./lib/system-tools.mjs";
+import { SYSTEM_TOOLS, assertMacOsHost } from "./lib/system-tools.mjs";
+
+// Every route through this script validates the app bundle with plutil and copies it with ditto,
+// so there is no point discovering the host cannot do that after a 150 MB download.
+assertMacOsHost("Bootstrapping the pinned 0.18 runtime");
 
 async function exists(target) {
   try {
@@ -50,13 +54,34 @@ async function downloadDmg() {
   }
   const partial = `${cachedDmg}.partial`;
   await rm(partial, { force: true });
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(partial, { mode: 0o600 }));
-  const digest = await sha256(partial);
-  if (digest !== dmgSha256) {
+  // A dropped connection or a mismatched digest must not leave a ~150 MB scratch file in the
+  // cache, so every exit from here removes it and only a verified download is promoted.
+  try {
+    await pipeline(Readable.fromWeb(response.body), createWriteStream(partial, { mode: 0o600 }));
+    const digest = await sha256(partial);
+    if (digest !== dmgSha256) {
+      throw new Error(`DMG checksum mismatch: expected ${dmgSha256}, got ${digest}`);
+    }
+    await rename(partial, cachedDmg);
+  } catch (error) {
     await rm(partial, { force: true });
-    throw new Error(`DMG checksum mismatch: expected ${dmgSha256}, got ${digest}`);
+    throw error;
   }
-  await rename(partial, cachedDmg);
+}
+
+// `hdiutil detach` fails while anything still holds the volume, which on a desktop is routinely
+// Spotlight indexing the image it has just seen appear. Retry before giving up.
+async function detachQuietly(mountRoot) {
+  for (const delayMs of [0, 500, 2_000]) {
+    if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+    try {
+      await run(SYSTEM_TOOLS.hdiutil, ["detach", mountRoot]);
+      return null;
+    } catch (error) {
+      if (delayMs === 2_000) return error;
+    }
+  }
+  return null;
 }
 
 async function extractRuntime() {
@@ -67,8 +92,11 @@ async function extractRuntime() {
     attached = true;
     await cacheRuntimeFromApp(path.join(mountRoot, "Grok Bot.app"));
   } finally {
-    if (attached) await run(SYSTEM_TOOLS.hdiutil, ["detach", mountRoot]);
-    await rm(mountRoot, { recursive: true, force: true });
+    // A throw from `finally` would replace whatever went wrong inside the block and skip the
+    // cleanup below it, leaving the image attached with no explanation of why.
+    const detachFailure = attached ? await detachQuietly(mountRoot) : null;
+    if (detachFailure == null) await rm(mountRoot, { recursive: true, force: true });
+    else console.warn(`Could not detach the release image; run: ${SYSTEM_TOOLS.hdiutil} detach ${mountRoot}\n  ${String(detachFailure)}`);
   }
 }
 

@@ -15,7 +15,9 @@ import {
 import { prepareReconstructedElectronMainArtifactFallback } from "./lib/build-asar.mjs";
 import { resolvePackagedAppArtifacts } from "./lib/packaged-app.mjs";
 import { capture, run } from "./lib/process.mjs";
-import { SYSTEM_TOOLS } from "./lib/system-tools.mjs";
+import { SYSTEM_TOOLS, assertMacOsHost } from "./lib/system-tools.mjs";
+
+assertMacOsHost("Verifying a packaged application");
 
 function readAppArgument(argv) {
   const index = argv.indexOf("--app");

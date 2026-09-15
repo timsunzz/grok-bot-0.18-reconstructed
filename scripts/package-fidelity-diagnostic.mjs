@@ -15,9 +15,9 @@ import {
   verifyReconstructedMacPackage,
 } from "./lib/macos-package-verification.mjs";
 import { run } from "./lib/process.mjs";
-import { SYSTEM_TOOLS } from "./lib/system-tools.mjs";
+import { SYSTEM_TOOLS, assertMacOsHost } from "./lib/system-tools.mjs";
 
-if (process.platform !== "darwin") throw new Error("The fidelity diagnostic app can only be packaged on macOS");
+assertMacOsHost("Packaging the fidelity diagnostic app");
 
 const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
 const diagnosticRoot = path.join(repoRoot, ".build", "diagnostic-fidelity");
