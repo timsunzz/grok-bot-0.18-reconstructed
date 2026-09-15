@@ -118,7 +118,8 @@ Remote mode remains the default.
 ## Requirements
 
 - macOS on Apple Silicon
-- Node.js 26.5.x
+- Node.js `>=26.5.0 <27` (the range `package.json` declares; the tests and
+  typecheck are unreliable on an older major)
 - Xcode Command Line Tools
 - Git LFS
 - Docker Desktop (optional, only for the local sandbox)
@@ -192,7 +193,8 @@ The main source areas are:
   workspace;
 - `scripts/` — bootstrap, compilation, renderer patching, packaging, signing,
   and verification; and
-- `tests/` — publication and router regressions.
+- `tests/` — publication, router, settings-durability, box-lifecycle, and
+  build-toolchain regressions.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for more detail.
 
@@ -208,6 +210,10 @@ npm run verify            # verify an existing packaged app
 npm run smoke             # bounded native smoke check
 npm run publication:check # prove a fresh-history export is lossless
 ```
+
+The installer-integrity test verifies the preserved 0.18.0 DMG and EXE against
+their recorded sizes and hashes. Without `git lfs pull` those paths hold LFS
+pointer files, and that one test reports itself as skipped rather than failing.
 
 Generated directories including `.cache`, `.build`, `dist`, `src/app/dist`,
 `recovered`, `recovery`, and local probe roots are ignored.
