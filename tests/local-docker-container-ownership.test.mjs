@@ -30,6 +30,9 @@ case " $FAKE_DOCKER_HANG " in
   *" $1 "*) exec sleep 600 ;;
 esac
 if [ -n "$FAKE_DOCKER_STDERR_NOISE" ]; then echo "$FAKE_DOCKER_STDERR_NOISE" >&2; fi
+case " $FAKE_DOCKER_FAIL " in
+  *" $1 "*) echo "Error response from daemon: cannot $1 grok-bot-local-vm" >&2; exit 1 ;;
+esac
 if [ "$1" = "inspect" ]; then
   if [ -n "$FAKE_DOCKER_INSPECT_ERROR" ]; then echo "$FAKE_DOCKER_INSPECT_ERROR" >&2; exit 1; fi
   if [ -s "$FAKE_DOCKER_INSPECT" ]; then cat "$FAKE_DOCKER_INSPECT"; exit 0; fi
@@ -98,6 +101,7 @@ async function loadConnector(options = {}) {
       process.env.PATH = previousPath ?? "";
       delete process.env.FAKE_DOCKER_INSPECT_ERROR;
       delete process.env.FAKE_DOCKER_STDERR_NOISE;
+      delete process.env.FAKE_DOCKER_FAIL;
       await rm(temporary, { recursive: true, force: true });
     },
   };
@@ -300,6 +304,34 @@ test("a container already holding this host's token is started as it is", { time
     assert.deepEqual(commands.filter((line) => line.startsWith("start")), ["start grok-bot-local-vm"]);
   } finally {
     await gateway.close();
+    await loaded.dispose();
+  }
+});
+
+test("a container from the previous build is replaced for predating the contract", { timeout: 60_000 }, async () => {
+  const loaded = await loadConnector({ withRuntime: true });
+  try {
+    // What the previous build wrote: the schema version it knew, and no gateway-token label at all,
+    // because that label did not exist yet. Every other part of its configuration is current.
+    const token = "d".repeat(64);
+    await loaded.writeToken(token);
+    await loaded.setContainer(ownedContainer({
+      "com.grok-bot.local-vm.schema-version": "6",
+      "com.grok-bot.local-vm.host-sha256": loaded.runtime.hostSha256,
+      "com.grok-bot.local-vm.gateway-token-sha256": createHash("sha256").update(token).digest("hex"),
+    }, false));
+    // The reason is only spoken aloud when the replacement itself fails, which is also the case in
+    // which a person has to act on it.
+    process.env.FAKE_DOCKER_FAIL = "rm";
+
+    // The schema version is what says "this container predates the contract", and it has to be the
+    // reason given: an absent label is not a rotated token, and telling someone their box is being
+    // destroyed over a credential it never had sends them looking in the wrong place.
+    await assert.rejects(
+      loaded.module.startLocalDockerBox(loaded.settingsPath),
+      /predates this app's local VM contract/,
+    );
+  } finally {
     await loaded.dispose();
   }
 });
