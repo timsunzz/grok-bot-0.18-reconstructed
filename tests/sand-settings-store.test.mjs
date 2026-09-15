@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -80,6 +80,28 @@ test("a missing settings file is a fresh start, not a recovery", async () => {
 
     assert.deepEqual((await readdir(path.dirname(settingsPath))).filter((name) => name !== "settings.json"), []);
     assert.equal(store.getInferenceProvider(), "openrouter");
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("a read that fails is not mistaken for corruption", async () => {
+  const loaded = await loadStore();
+  try {
+    const settingsPath = path.join(loaded.temporary, "state", "settings.json");
+    const store = new loaded.module.SandSettingsStore(settingsPath);
+    store.setInferenceProvider("codex");
+
+    // A directory stands in for any present-but-unreadable file: `EISDIR` here, `EACCES` or
+    // `EIO` in the field. None of them says anything about the content, so quarantining and
+    // writing defaults over the top would reset every preference on a momentary failure — and
+    // the host, the coordinator, and Electron main share this file.
+    await rm(settingsPath);
+    await mkdir(settingsPath);
+
+    assert.throws(() => store.setThemePreference("dark"), /EISDIR/);
+    assert.deepEqual((await readdir(path.dirname(settingsPath))).filter((name) => name.includes(".unreadable-")), []);
+    assert.ok((await stat(settingsPath)).isDirectory(), "the unreadable path must be left alone");
   } finally {
     await loaded.dispose();
   }

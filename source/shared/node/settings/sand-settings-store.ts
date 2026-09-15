@@ -94,20 +94,30 @@ function parseSettings(value: unknown): SandStoredSettings | null {
 export class SandSettingsStore {
   constructor(readonly settingsPath: string) {}
   load(): SandStoredSettings { return this.read().settings; }
-  // `unreadable` separates "there is nothing here yet" from "there is something here we could
-  // not understand". Only the first may be overwritten with defaults; see `update`.
-  private read(): { readonly settings: SandStoredSettings; readonly unreadable: boolean } {
+  /**
+   * `corrupt` separates "there is nothing here yet" from "there is something here we could not
+   * understand". Only the first may be overwritten with defaults; see `update`.
+   *
+   * A read that fails outright is neither: `EACCES`, `EIO`, and `EMFILE` say nothing about the
+   * content, so answering with defaults would let a momentary failure reset every stored
+   * preference. The host, the coordinator, and Electron main all share this file, so one
+   * process's blip would reset it for the others too. It throws instead.
+   */
+  private read(): { readonly settings: SandStoredSettings; readonly corrupt: boolean } {
     let raw: string;
     try { raw = readFileSync(this.settingsPath, "utf8"); }
-    catch (error) { return { settings: emptySettings(), unreadable: (error as { code?: unknown }).code !== "ENOENT" }; }
+    catch (error) {
+      if ((error as { code?: unknown }).code !== "ENOENT") throw error;
+      return { settings: emptySettings(), corrupt: false };
+    }
     try {
       const parsed = parseSettings(JSON.parse(raw) as unknown);
-      return parsed == null ? { settings: emptySettings(), unreadable: true } : { settings: this.applyPendingMigrations(parsed), unreadable: false };
-    } catch { return { settings: emptySettings(), unreadable: true }; }
+      return parsed == null ? { settings: emptySettings(), corrupt: true } : { settings: this.applyPendingMigrations(parsed), corrupt: false };
+    } catch { return { settings: emptySettings(), corrupt: true }; }
   }
-  // A transient read error, a truncated file, or a file written by a newer schema would
-  // otherwise be replaced by defaults on the next write, losing every stored preference
-  // silently. Move it aside first so it can be recovered.
+  // A truncated file or a file written by a newer schema would otherwise be replaced by defaults
+  // on the next write, losing every stored preference silently. Move it aside so it can be
+  // recovered.
   private quarantineUnreadable(): void {
     try { renameSync(this.settingsPath, `${this.settingsPath}.unreadable-${Date.now()}`); } catch {}
   }
@@ -132,8 +142,8 @@ export class SandSettingsStore {
     }
   }
   private update(mutator: (settings: SandStoredSettings) => SandStoredSettings): void {
-    const { settings, unreadable } = this.read();
-    if (unreadable) this.quarantineUnreadable();
+    const { settings, corrupt } = this.read();
+    if (corrupt) this.quarantineUnreadable();
     this.persist(mutator(settings));
   }
   getHasSeenOnboarding(): boolean | undefined { return this.load().hasSeenOnboarding; }
