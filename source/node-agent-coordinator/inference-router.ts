@@ -3,6 +3,13 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { runRoutedProviderText } from "../host/extensions/inference/provider-session.js";
+import {
+  classifyRoutedProviderError,
+  formatRoutedProviderError,
+  resolveRoutedTurnTimeoutMs,
+  runWithRoutedRetry,
+  withRoutedTurnDeadline,
+} from "../shared/bot-mode.js";
 import type { SandInferenceProvider } from "../shared/inference-router.js";
 import { SandSettingsStore } from "../shared/node/settings/sand-settings-store.js";
 import { createRoutedMcpBridge } from "./routed-mcp-bridge.js";
@@ -54,11 +61,23 @@ export function createCoordinatorInferenceRouter(options: {
   readonly postEvent: (family: string, payload: unknown) => void;
   readonly dispatchRemote: (method: string, args: unknown) => Promise<unknown>;
   readonly now?: () => number;
+  readonly runProvider?: typeof runRoutedProviderText;
+  readonly composingDelayMs?: number;
+  readonly turnTimeoutMs?: number;
+  readonly retry?: {
+    readonly maxAttempts?: number;
+    readonly baseDelayMs?: number;
+    readonly maxDelayMs?: number;
+    readonly sleep?: (ms: number) => Promise<void>;
+  };
+  readonly signal?: AbortSignal;
 }) {
   const settings = new SandSettingsStore(join(options.dataDir, "settings.json"));
   const storePath = join(options.dataDir, "inference-router-transcript.json");
   const now = options.now ?? Date.now;
+  const runProvider = options.runProvider ?? runRoutedProviderText;
   const queues = new Map<string, Promise<unknown>>();
+  const inFlightNonces = new Set<string>();
 
   const load = async (): Promise<Store> => {
     try { return parseInferenceRouterTranscriptStore(JSON.parse(await readFile(storePath, "utf8"))); }
@@ -118,6 +137,8 @@ export function createCoordinatorInferenceRouter(options: {
     await persist({ schemaVersion: 2, agents: { ...current.agents, [agentId]: nextEntries } });
     return projectInferenceRouterTranscriptEntry(updated);
   };
+  const findNonce = (store: Store, agentId: string, clientNonce: string): StoredEntry | undefined =>
+    (store.agents[agentId] ?? []).find((entry) => entry.clientNonce === clientNonce);
   const execute = async (provider: Exclude<SandInferenceProvider, "cursor">, args: Record<string, unknown>) => {
     const agentId = typeof args.agentId === "string" ? args.agentId : "";
     const prompt = typeof args.prompt === "string" ? args.prompt : "";
@@ -148,7 +169,20 @@ export function createCoordinatorInferenceRouter(options: {
     // transcript needs roughly 350 ms to materialize its trailing activity row,
     // so keep the composing state authoritative long enough for a clearly
     // perceptible rendered interval before normal token streaming begins.
-    await new Promise<void>(resolve => setTimeout(resolve, 1_200));
+    await new Promise<void>((resolve, reject) => {
+      const delayMs = options.composingDelayMs;
+      const timer = delayMs == null ? setTimeout(resolve, 1_200) : setTimeout(resolve, delayMs);
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new Error("Routed provider turn was cancelled."));
+      };
+      if (options.signal?.aborted) {
+        clearTimeout(timer);
+        reject(new Error("Routed provider turn was cancelled."));
+        return;
+      }
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+    });
     const messages = (withUser.agents[agentId] ?? []).map(entry => ({ role: entry.role, content: entry.content }));
     let content: string;
     const assistantTimestampMs = now();
@@ -166,19 +200,36 @@ export function createCoordinatorInferenceRouter(options: {
     const directTools = bridge == null ? await options.dispatchRemote("listRoutedMcpTools", {}) : undefined;
     const tools = Array.isArray(directTools) ? directTools as Record<string, any>[] : undefined;
     const onTextDelta = (_delta: string, accumulated: string) => emitAssistant(accumulated, true);
-    try { content = await runRoutedProviderText(provider, messages, bridge == null ? {
-      ...(tools === undefined ? {} : { tools }),
-      executeTool: async (definition, toolArgs, toolCallId) => await options.dispatchRemote("executeRoutedMcpTool", {
-        providerIdentifier: definition.providerIdentifier,
-        name: definition.name,
-        toolName: definition.toolName,
-        args: toolArgs,
-        toolCallId,
-        agentId,
-      }),
-      onTextDelta,
-    } : { mcpServerUrl: bridge.url, onTextDelta }); }
-    finally { endActivity(); await bridge?.close(); }
+    try {
+      const invoke = async (signal: AbortSignal) => await runProvider(provider, messages, bridge == null ? {
+        ...(tools === undefined ? {} : { tools }),
+        executeTool: async (definition, toolArgs, toolCallId) => await options.dispatchRemote("executeRoutedMcpTool", {
+          providerIdentifier: definition.providerIdentifier,
+          name: definition.name,
+          toolName: definition.toolName,
+          args: toolArgs,
+          toolCallId,
+          agentId,
+        }),
+        onTextDelta,
+        signal,
+      } : { mcpServerUrl: bridge.url, onTextDelta, signal });
+      content = await runWithRoutedRetry(
+        () => withRoutedTurnDeadline(invoke, {
+          timeoutMs: options.turnTimeoutMs ?? resolveRoutedTurnTimeoutMs(),
+          ...(options.signal == null ? {} : { signal: options.signal }),
+        }),
+        {
+          maxAttempts: options.retry?.maxAttempts ?? 3,
+          baseDelayMs: options.retry?.baseDelayMs ?? 500,
+          maxDelayMs: options.retry?.maxDelayMs ?? 4_000,
+          ...(options.retry?.sleep == null ? {} : { sleep: options.retry.sleep }),
+          isRetryable: (error) => classifyRoutedProviderError(error).retryable,
+        },
+      );
+    } catch (error) {
+      content = formatRoutedProviderError(provider, classifyRoutedProviderError(error));
+    } finally { endActivity(); await bridge?.close(); }
     await append(agentId, [{ provider, role: "assistant", content, id: assistantId, timestampMs: assistantTimestampMs }]);
     emitAssistant(content, false);
     return { accepted: true, clientNonce, provider };
@@ -212,20 +263,42 @@ export function createCoordinatorInferenceRouter(options: {
       if (method !== "sendPrompt" || provider === "cursor") return { handled: false };
       const record = asRecord(args) ?? {};
       const agentId = typeof record.agentId === "string" ? record.agentId : "";
+      const prompt = typeof record.prompt === "string" ? record.prompt : "";
+      if (agentId.length === 0 || prompt.length === 0) {
+        return { handled: true, value: { accepted: false, error: "Local inference routing requires an agentId and prompt", provider } };
+      }
+      const clientNonce = typeof record.clientNonce === "string" && record.clientNonce.length > 0 ? record.clientNonce : undefined;
+      if (clientNonce != null) {
+        const nonceKey = `${agentId}\0${clientNonce}`;
+        if (inFlightNonces.has(nonceKey) || findNonce(await load(), agentId, clientNonce) != null) {
+          return { handled: true, value: { accepted: true, clientNonce, provider, coalesced: true } };
+        }
+        inFlightNonces.add(nonceKey);
+      }
       const previous = queues.get(agentId) ?? Promise.resolve();
       const next = previous.catch(() => undefined).then(() => execute(provider, record)).catch(async (error) => {
+        const classified = classifyRoutedProviderError(error);
         const timestampMs = now();
-        const content = `Router error: ${error instanceof Error ? error.message : String(error)}`;
+        const content = formatRoutedProviderError(provider, classified);
         if (agentId.length > 0) {
           const id = `t${Date.now()}s0`;
           await append(agentId, [{ provider, role: "assistant", content, id, timestampMs }]);
           emitTranscript(agentId, "appended", { kind: "send-message", id, message: { type: "text", content }, timestampMs });
         }
+      }).finally(() => {
+        if (clientNonce != null) inFlightNonces.delete(`${agentId}\0${clientNonce}`);
       });
       const queued = next.finally(() => { if (queues.get(agentId) === queued) queues.delete(agentId); });
       queues.set(agentId, queued);
       void queued;
       return { handled: true, value: { accepted: true, clientNonce: record.clientNonce, provider } };
+    },
+    async whenIdle(agentId?: string): Promise<void> {
+      if (agentId != null) {
+        await (queues.get(agentId) ?? Promise.resolve());
+        return;
+      }
+      await Promise.all([...queues.values()]);
     },
   };
 }

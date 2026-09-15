@@ -28,6 +28,7 @@ export type CodexDirectOptions = {
   readonly tools?: readonly CodexDirectTool[];
   readonly executeTool?: (tool: CodexDirectTool, args: unknown, toolCallId: string) => Promise<unknown>;
   readonly maxSteps?: number;
+  readonly signal?: AbortSignal;
 };
 
 function record(value: unknown): Loose | null {
@@ -118,9 +119,11 @@ export async function* streamCodexDirectResponses(options: CodexDirectOptions): 
 
   for (let step = 0; step < maxSteps; step += 1) {
     const declaredTools = requestTools(options.tools);
+    if (options.signal?.aborted) throw new Error("Routed provider turn was cancelled.");
     const response = await options.fetch(options.endpoint, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "text/event-stream", "user-agent": "grok-bot-router/1" },
+      ...(options.signal == null ? {} : { signal: options.signal }),
       body: JSON.stringify({
         model: options.model,
         instructions: options.instructions,

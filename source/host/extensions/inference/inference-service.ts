@@ -44,7 +44,9 @@ export function createHostInference(options: HostInferenceOptions) {
             ...(typeof usage.cacheReadTokens === "number" ? { cacheReadTokens: usage.cacheReadTokens } : {}),
             ...(typeof usage.cacheWriteTokens === "number" ? { cacheWriteTokens: usage.cacheWriteTokens } : {}),
           });
-        }).catch(() => {});
+        }).catch((error: unknown) => {
+          console.warn("[sand] routed usage recording failed", error instanceof Error ? error.message : error);
+        });
       }
       return result;
     },

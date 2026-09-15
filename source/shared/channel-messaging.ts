@@ -1,5 +1,14 @@
 import { clampLine } from "./sand-text.js";
 import {
+  admitBotInboundMessage,
+  authorizeBotSender,
+  buildBotSessionKey,
+  createBotEventDedupe,
+  createBotRateLimiter,
+  type BotAuthPolicy,
+  type BotChatType,
+} from "./bot-mode.js";
+import {
   findConnectorManifest,
   formatChannelAddress,
   hasChannelsToShow,
@@ -145,6 +154,153 @@ export interface ChannelInboundEnvelope {
   readonly sender: string;
   readonly text: string;
   readonly reaction?: ChannelReaction | null;
+  readonly senderId?: string;
+  readonly chatType?: BotChatType;
+  readonly threadId?: string;
+  readonly mentionedBot?: boolean;
+  readonly mentionedOthers?: boolean;
+  readonly eventId?: string;
+}
+
+export interface ChannelInboundPolicy {
+  readonly auth?: BotAuthPolicy;
+  readonly requireMention?: boolean;
+  readonly ignoreNoMention?: boolean;
+}
+
+export interface ChannelInboundDecision {
+  readonly admit: boolean;
+  readonly reason?: string;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value != null && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function parseChannelAddressLike(value: unknown): ChannelAddress | null {
+  if (typeof value === "string") return parseChannelAddress(value);
+  const row = asRecord(value);
+  if (row == null) return null;
+  const platform = typeof row.platform === "string" ? row.platform.trim() : "";
+  const chat = typeof row.chat === "string" ? row.chat.trim() : "";
+  return platform.length === 0 || chat.length === 0 ? null : { platform, chat };
+}
+
+function parseChannelReaction(value: unknown): ChannelReaction | null {
+  const row = asRecord(value);
+  if (row == null || typeof row.emoji !== "string" || row.emoji.trim().length === 0) return null;
+  const messageQuote = typeof row.messageQuote === "string" && row.messageQuote.length > 0 ? row.messageQuote : undefined;
+  return messageQuote == null ? { emoji: row.emoji } : { emoji: row.emoji, messageQuote };
+}
+
+export function parseChannelInboundEnvelope(value: unknown): ChannelInboundEnvelope | null {
+  const row = asRecord(value);
+  if (row == null) return null;
+  const address = parseChannelAddressLike(row.address);
+  if (address == null || typeof row.sender !== "string" || row.sender.trim().length === 0) return null;
+  const text = typeof row.text === "string" ? row.text : "";
+  const reaction = parseChannelReaction(row.reaction);
+  if (text.length === 0 && reaction == null) return null;
+  const chatType = row.chatType === "private" || row.chatType === "group" || row.chatType === "channel" || row.chatType === "thread"
+    ? row.chatType
+    : undefined;
+  return {
+    address,
+    sender: row.sender,
+    text,
+    ...(reaction == null ? {} : { reaction }),
+    ...(typeof row.senderId === "string" && row.senderId.trim().length > 0 ? { senderId: row.senderId } : {}),
+    ...(chatType == null ? {} : { chatType }),
+    ...(typeof row.threadId === "string" && row.threadId.trim().length > 0 ? { threadId: row.threadId } : {}),
+    ...(typeof row.mentionedBot === "boolean" ? { mentionedBot: row.mentionedBot } : {}),
+    ...(typeof row.mentionedOthers === "boolean" ? { mentionedOthers: row.mentionedOthers } : {}),
+    ...(typeof row.eventId === "string" && row.eventId.trim().length > 0 ? { eventId: row.eventId } : {}),
+  };
+}
+
+export function resolveChannelInboundPolicy(env: NodeJS.ProcessEnv = process.env): ChannelInboundPolicy {
+  const allowedUsers = (env.SAND_CHANNEL_ALLOWED_USERS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  return {
+    auth: {
+      allowAll: env.SAND_CHANNEL_ALLOW_ALL === "1",
+      ...(allowedUsers.length === 0 ? {} : { allowedUsers }),
+    },
+    requireMention: env.SAND_CHANNEL_REQUIRE_MENTION === "1",
+    ignoreNoMention: env.SAND_CHANNEL_IGNORE_NO_MENTION !== "0",
+  };
+}
+
+export function channelInboundSessionKey(agentId: string, envelope: ChannelInboundEnvelope): string {
+  return buildBotSessionKey({
+    agentId,
+    platform: envelope.address.platform,
+    chatType: envelope.chatType,
+    chatId: envelope.address.chat,
+    ...(envelope.threadId == null ? {} : { threadId: envelope.threadId }),
+  });
+}
+
+export function evaluateChannelInbound(
+  envelope: ChannelInboundEnvelope,
+  policy: ChannelInboundPolicy = {},
+): ChannelInboundDecision {
+  const senderId = envelope.senderId ?? envelope.sender;
+  const auth = authorizeBotSender(senderId, policy.auth);
+  if (!auth.allowed) return { admit: false, reason: auth.reason ?? "not-allowlisted" };
+  const mention = admitBotInboundMessage({
+    ...(envelope.chatType == null ? {} : { chatType: envelope.chatType }),
+    ...(envelope.mentionedBot == null ? {} : { mentionedBot: envelope.mentionedBot }),
+    ...(envelope.mentionedOthers == null ? {} : { mentionedOthers: envelope.mentionedOthers }),
+    ...(policy.requireMention == null ? {} : { requireMention: policy.requireMention }),
+    ...(policy.ignoreNoMention == null ? {} : { ignoreNoMention: policy.ignoreNoMention }),
+  });
+  return mention.admit ? { admit: true } : { admit: false, reason: mention.reason };
+}
+
+export function filterChannelInboundEnvelopes(
+  envelopes: readonly ChannelInboundEnvelope[],
+  policy: ChannelInboundPolicy = {},
+  options?: { readonly seenEvent?: (eventId: string) => boolean },
+): {
+  readonly admitted: ChannelInboundEnvelope[];
+  readonly rejected: readonly { readonly envelope: ChannelInboundEnvelope; readonly reason: string }[];
+} {
+  const admitted: ChannelInboundEnvelope[] = [];
+  const rejected: { envelope: ChannelInboundEnvelope; reason: string }[] = [];
+  for (const envelope of envelopes) {
+    if (envelope.eventId != null && options?.seenEvent?.(envelope.eventId) === true) {
+      rejected.push({ envelope, reason: "duplicate-event" });
+      continue;
+    }
+    const decision = evaluateChannelInbound(envelope, policy);
+    if (decision.admit) admitted.push(envelope);
+    else rejected.push({ envelope, reason: decision.reason ?? "rejected" });
+  }
+  return { admitted, rejected };
+}
+
+export function createChannelInboundGate(options?: {
+  readonly policy?: ChannelInboundPolicy;
+  readonly now?: () => number;
+}) {
+  const policy = options?.policy ?? resolveChannelInboundPolicy();
+  const clock = options?.now == null ? {} : { now: options.now };
+  const dedupe = createBotEventDedupe(clock);
+  const limiter = createBotRateLimiter(clock);
+  return {
+    admit(agentId: string, value: unknown): ChannelInboundEnvelope | null {
+      const envelope = parseChannelInboundEnvelope(value);
+      if (envelope == null) return null;
+      const decision = evaluateChannelInbound(envelope, policy);
+      if (!decision.admit) return null;
+      if (envelope.eventId != null && dedupe.seen(envelope.eventId)) return null;
+      const rate = limiter.take(channelInboundSessionKey(agentId, envelope));
+      return rate.allowed ? envelope : null;
+    },
+  };
 }
 
 export function formatChannelReactionSummary(reaction: ChannelReaction): string {

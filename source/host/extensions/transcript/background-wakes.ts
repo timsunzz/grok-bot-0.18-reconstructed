@@ -8,6 +8,7 @@ import {
   buildChannelDeliveryFailureWakePrompt,
   buildChannelInboundWakePrompt,
   buildChannelOutboundMessage,
+  createChannelInboundGate,
   humanizeChannelDeliveryFailure,
 } from "../../../shared/channel-messaging.js";
 import { formatChannelAddress } from "../../../shared/channels.js";
@@ -48,6 +49,7 @@ export class BackgroundWakes {
   readonly revivingShellAgentIds;
   readonly pendingAgentInbound;
 
+  readonly inboundGate = createChannelInboundGate();
   constructor(readonly tm: TranscriptManagerLike) {
     this.completionRevivals = new CompletionRevivals(tm);
     this.agentToAgent = new AgentToAgentMessaging(tm);
@@ -173,9 +175,11 @@ export class BackgroundWakes {
   }
 
   wakeForInbound(agentId: string, envelope: unknown): void {
+    const admitted = this.inboundGate.admit(agentId, envelope);
+    if (admitted == null) return;
     if (
       this.tm.pendingWakes.enqueuePendingWake(this.pendingInbound, agentId, [
-        envelope,
+        admitted,
       ])
     )
       void this.reviveForInbound(agentId);

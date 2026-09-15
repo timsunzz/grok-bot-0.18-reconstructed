@@ -1,3 +1,4 @@
+import { DEFAULT_BOT_PENDING_QUEUE_CAP } from "../../../shared/bot-mode.js";
 import type { TranscriptManagerLike } from "./transcript-hub.js";
 
 export function isRecreateWakeCarryDisabled(): boolean {
@@ -268,7 +269,9 @@ export class PendingWakeRearm {
   ): boolean {
     if (this.tm.sessions.isAgentGone(agentId)) return false;
     const queued = queue.get(agentId) ?? [];
-    queued.push(...items);
+    const room = Math.max(0, DEFAULT_BOT_PENDING_QUEUE_CAP - queued.length);
+    if (room === 0) return false;
+    queued.push(...items.slice(0, room));
     queue.set(agentId, queued);
     return true;
   }
