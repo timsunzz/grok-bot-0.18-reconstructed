@@ -40,6 +40,7 @@ async function withoutUnhandledRejections(run) {
 
 function unreachableBoxHandlers(module) {
   const unreachable = async () => { throw new Error("gateway unreachable"); };
+  let provider = "cursor";
   const stores = {
     getUserTimeZoneOverride: () => undefined,
     setUserTimeZoneOverride: () => {},
@@ -47,8 +48,11 @@ function unreachableBoxHandlers(module) {
     setComputerUseModel: () => {},
     getWebauthnProxyEnabled: () => true,
     setWebauthnProxyEnabled: () => {},
+    getInferenceProvider: () => provider,
+    setInferenceProvider: (next) => { provider = next; },
+    getInferenceRouterUsage: () => null,
   };
-  return module.createMainEdgeHandlers({
+  const handlers = module.createMainEdgeHandlers({
     readLiveUpdateService: () => null,
     readThemeController: () => null,
     readEgressTunnelController: () => null,
@@ -76,12 +80,13 @@ function unreachableBoxHandlers(module) {
     detectTimeZone: () => "UTC",
     delay: async () => {},
   });
+  return { handlers, storedProvider: () => provider };
 }
 
 test("an unreachable box leaves no unobserved rejection behind the edge's fire-and-forget syncs", async () => {
   const loaded = await loadMainEdge();
   try {
-    const handlers = unreachableBoxHandlers(loaded.module);
+    const { handlers } = unreachableBoxHandlers(loaded.module);
 
     // These handlers answer the renderer from local state and push to the box without awaiting,
     // so a rejection had no handler at all. Node treats that as fatal by default, which means a
@@ -98,10 +103,24 @@ test("an unreachable box leaves no unobserved rejection behind the edge's fire-a
   }
 });
 
+test("a provider the box never received is not reported as the active provider", async () => {
+  const loaded = await loadMainEdge();
+  try {
+    const { handlers, storedProvider } = unreachableBoxHandlers(loaded.module);
+
+    // The box runs the routed turn, so swallowing the sync failure left the settings page naming
+    // one provider while every turn kept going to the previous one.
+    await assert.rejects(handlers.setInferenceRouter({ provider: "codex" }), /Couldn't reach the computer/);
+    assert.equal(storedProvider(), "cursor");
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("the webauthn mirror keeps retrying an unreachable box instead of failing the call", async () => {
   const loaded = await loadMainEdge();
   try {
-    const handlers = unreachableBoxHandlers(loaded.module);
+    const { handlers } = unreachableBoxHandlers(loaded.module);
 
     // The retry loop awaited the sync without catching, so the first rejection escaped as the
     // handler's own error and the remaining attempts never ran, even though the local toggle had
