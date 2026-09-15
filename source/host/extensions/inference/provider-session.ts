@@ -9,6 +9,7 @@ import { jsonSchema, streamText, tool, type CoreMessage, type LanguageModelV1, t
 import { BasePromptBuilder, BasePromptExecutor } from "../../../packages/chat-inference/base.js";
 import type { SandInferenceProvider } from "../../../shared/inference-router.js";
 import { resolveClaudeCodeCliPath } from "../../../shared/node/inference-router-local.js";
+import { ROUTED_TURN_TIMEOUT_ERROR_NAME } from "../../../shared/routed-turn-failure.js";
 import { getSandRootDir } from "../../host-paths.js";
 import { SandSettingsStore } from "../../../shared/node/settings/sand-settings-store.js";
 import { getBoxSecretsStorePath } from "../secrets/secrets-service.js";
@@ -20,6 +21,9 @@ interface ProviderMessage extends LabelMessage { role: string; content: string |
 type RoutedProvider = Exclude<SandInferenceProvider, "cursor">;
 type UsageRecord = { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number };
 type RoutedToolExecutor = (tool: Loose, args: unknown, toolCallId: string) => Promise<unknown>;
+// What the caller controls about the provider request itself: when to give up on it, and how many
+// times the provider client may retry on its own before the caller hears about a failure.
+type RoutedRuntime = { readonly signal?: AbortSignal; readonly abortController?: AbortController; readonly maxRetries?: number };
 
 const GROK_ROUTER_SYSTEM_PROMPT = [
   "You are Grok Bot, a warm, concise desktop assistant.",
@@ -194,7 +198,7 @@ function codexTools(definitions: readonly Loose[] | undefined): CodexDirectTool[
   return tools.length === 0 ? undefined : tools;
 }
 
-function codexExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void) {
+function codexExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, runtime: RoutedRuntime = {}) {
   const credentials = codexCredentials();
   const usage = deferred<{ promptTokens: number; completionTokens: number; totalTokens: number }>();
   const extendedUsage = deferred<{ inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; maxTokens: number }>();
@@ -219,6 +223,7 @@ function codexExecutor(messages: readonly ProviderMessage[], invocationId: strin
         input: messages.map(message => ({ role: message.role === "assistant" ? "assistant" : "user", content: typeof message.content === "string" ? message.content : JSON.stringify(message.content) })),
         ...(tools == null ? {} : { tools }),
         ...(executeTool == null ? {} : { executeTool: async (selected, args, toolCallId) => await executeTool(selected.source, args, toolCallId) }),
+        ...(runtime.signal == null ? {} : { signal: runtime.signal }),
         maxSteps: tools == null ? 1 : 8,
       })) {
         if (event.type === "text-delta") { text += event.delta; yield { type: "text-delta" as const, textDelta: event.delta }; continue; }
@@ -236,7 +241,7 @@ function codexExecutor(messages: readonly ProviderMessage[], invocationId: strin
   return { fullStream, response: resultResponse.promise, usage: usage.promise, extendedUsage: extendedUsage.promise, providerMetadata: metadata.promise, invocationId: Promise.resolve(invocationId) };
 }
 
-function claudeExecutor(messages: readonly ProviderMessage[], invocationId: string, onUsage?: (usage: UsageRecord) => void, mcpServerUrl?: string) {
+function claudeExecutor(messages: readonly ProviderMessage[], invocationId: string, onUsage?: (usage: UsageRecord) => void, mcpServerUrl?: string, runtime: RoutedRuntime = {}) {
   const executable = resolveClaudeCodeCliPath();
   if (executable == null) throw new Error("Claude Code is not installed. Install and sign in to Claude Code, then reopen Grok Bot.");
   const usage = deferred<{ promptTokens: number; completionTokens: number; totalTokens: number }>();
@@ -248,7 +253,7 @@ function claudeExecutor(messages: readonly ProviderMessage[], invocationId: stri
     try {
       let final: SDKResultMessage | undefined;
       const selectedModel = process.env.SAND_CLAUDE_MODEL?.trim();
-      for await (const message of queryClaude({ prompt: providerPrompt(messages), options: { pathToClaudeCodeExecutable: executable, cwd: getSandRootDir(), tools: mcpServerUrl == null ? [] : ["mcp__grok_bot_plugins__*"], ...(mcpServerUrl == null ? {} : { mcpServers: { grok_bot_plugins: { type: "http" as const, url: mcpServerUrl } }, strictMcpConfig: true }), permissionMode: "default", maxTurns: mcpServerUrl == null ? 1 : 8, persistSession: false, ...(selectedModel == null || selectedModel.length === 0 ? {} : { model: selectedModel }) } })) if (message.type === "result") final = message;
+      for await (const message of queryClaude({ prompt: providerPrompt(messages), options: { ...(runtime.abortController == null ? {} : { abortController: runtime.abortController }), pathToClaudeCodeExecutable: executable, cwd: getSandRootDir(), tools: mcpServerUrl == null ? [] : ["mcp__grok_bot_plugins__*"], ...(mcpServerUrl == null ? {} : { mcpServers: { grok_bot_plugins: { type: "http" as const, url: mcpServerUrl } }, strictMcpConfig: true }), permissionMode: "default", maxTurns: mcpServerUrl == null ? 1 : 8, persistSession: false, ...(selectedModel == null || selectedModel.length === 0 ? {} : { model: selectedModel }) } })) if (message.type === "result") final = message;
       if (final == null) throw new Error("Claude Code ended without a result.");
       if (final.subtype !== "success") throw new Error(final.errors.join("\n") || `Claude Code failed (${final.subtype}).`);
       const text = final.result;
@@ -284,11 +289,15 @@ function toToolSet(definitions: readonly Loose[] | undefined, executeTool?: Rout
   return Object.keys(tools).length === 0 ? undefined : tools;
 }
 
-function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void) {
+function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, runtime: RoutedRuntime = {}) {
   const id = process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
   const model: LanguageModelV1 = createOpenAI({ apiKey: openRouterCredential(), baseURL: "https://openrouter.ai/api/v1", compatibility: "compatible", name: "openrouter", headers: { "HTTP-Referer": "https://github.com/grok-bot-reconstructed", "X-Title": "Grok Bot Reconstructed" } }).chat(id as any);
   const tools = toToolSet(definitions, executeTool);
-  const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8 });
+  // `maxRetries` is the caller's to set. The AI SDK retries 429s and 5xx twice of its own accord,
+  // and a routed turn has its own retry that paces itself from `Retry-After`; leaving both on
+  // spends up to six provider requests on one rate-limited turn, three of them back to back
+  // before any header is read.
+  const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8, maxRetries: runtime.maxRetries ?? 2, ...(runtime.signal == null ? {} : { abortSignal: runtime.signal }) });
   const extendedUsage = observed(result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 0 })));
   if (onUsage != null) void extendedUsage.then(onUsage, () => {});
   return { fullStream: result.fullStream, response: observed(result.response), usage: observed(result.usage), extendedUsage, providerMetadata: observed(result.providerMetadata), invocationId: Promise.resolve(invocationId) };
@@ -308,26 +317,74 @@ export function createProviderPromptSession(provider: RoutedProvider): { getMode
   return { getModelId: () => modelId, getExecutor: state => new ProviderPromptExecutor(provider, Array.isArray(state) ? state as ProviderMessage[] : undefined, usage => recordRoutedUsage(provider, usage)) };
 }
 
+/**
+ * A provider that stops answering without closing its socket used to leave this promise pending
+ * for the life of the process. The coordinator serializes routed turns per agent, so that one
+ * turn silently swallowed every later prompt for that agent while the activity row kept pulsing.
+ *
+ * The ceiling is wall clock for the whole turn, tool steps included, so it has to be generous
+ * enough that a reasoning model working through eight steps finishes inside it.
+ */
+export const ROUTED_TURN_TIMEOUT_MS = 600_000;
+
+function routedTimeoutError(provider: RoutedProvider, timeoutMs: number): Error {
+  const error = new Error(`${provider} stopped responding: Grok Bot timed out this turn after ${Math.round(timeoutMs / 1_000)}s.`);
+  // Deliberately not `AbortError` or `TimeoutError`. Those are how a cancelled turn arrives, and
+  // a cancelled turn is never retried; this is the transient case the retry exists for.
+  error.name = ROUTED_TURN_TIMEOUT_ERROR_NAME;
+  return error;
+}
+
+async function withRoutedDeadline<T>(work: Promise<T>, provider: RoutedProvider, timeoutMs: number, controller: AbortController): Promise<T> {
+  if (!(timeoutMs > 0)) return await work;
+  // The work keeps running until the abort reaches it, and nobody is waiting on it by then.
+  work.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(routedTimeoutError(provider, timeoutMs));
+      reject(routedTimeoutError(provider, timeoutMs));
+    }, timeoutMs);
+    timer.unref();
+  });
+  try { return await Promise.race([work, deadline]); }
+  finally { clearTimeout(timer); }
+}
+
 export async function runRoutedProviderText(provider: RoutedProvider, messages: readonly ProviderMessage[], options?: {
   readonly mcpServerUrl?: string;
   readonly tools?: readonly Loose[];
   readonly executeTool?: RoutedToolExecutor;
   readonly onTextDelta?: (delta: string, accumulated: string) => void;
+  readonly timeoutMs?: number;
 }): Promise<string> {
   const invocationId = crypto.randomUUID();
   const onUsage = (usage: UsageRecord) => recordRoutedUsage(provider, usage);
+  const controller = new AbortController();
+  // The router owns the retry for these turns, and paces it from the provider's `Retry-After`,
+  // so the SDK must not quietly retry underneath it.
+  const runtime: RoutedRuntime = { signal: controller.signal, abortController: controller, maxRetries: 0 };
   const result = provider === "codex"
-    ? codexExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage)
+    ? codexExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage, runtime)
     : provider === "claude-code"
-      ? claudeExecutor(messages, invocationId, onUsage, options?.mcpServerUrl)
-      : openRouterExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage);
-  let text = "";
-  for await (const event of result.fullStream) {
-    if (event.type === "text-delta" && typeof event.textDelta === "string") {
-      text += event.textDelta;
-      options?.onTextDelta?.(event.textDelta, text);
+      ? claudeExecutor(messages, invocationId, onUsage, options?.mcpServerUrl, runtime)
+      : openRouterExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage, runtime);
+  const consume = async (): Promise<string> => {
+    let text = "";
+    for await (const event of result.fullStream) {
+      if (event.type === "text-delta" && typeof event.textDelta === "string") {
+        text += event.textDelta;
+        options?.onTextDelta?.(event.textDelta, text);
+        continue;
+      }
+      // The AI SDK reports a refused request as a stream part and then leaves `response` pending,
+      // so a turn that only awaited the promise waited out the whole deadline for a failure the
+      // provider had already stated. Raising it here is also what lets the router see the status
+      // and `Retry-After` the provider sent.
+      if (event.type === "error") throw event.error instanceof Error ? event.error : new Error(String(event.error));
     }
-  }
-  await result.response;
-  return text;
+    await result.response;
+    return text;
+  };
+  return await withRoutedDeadline(consume(), provider, options?.timeoutMs ?? ROUTED_TURN_TIMEOUT_MS, controller);
 }

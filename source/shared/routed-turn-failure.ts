@@ -24,6 +24,10 @@ export const ROUTED_TURN_FAILURE_REASONS = [
 
 export type RoutedTurnFailureReason = (typeof ROUTED_TURN_FAILURE_REASONS)[number];
 
+// The name a routed turn's own deadline carries. `provider-session.ts` raises it; the classifier
+// below reads it.
+export const ROUTED_TURN_TIMEOUT_ERROR_NAME = "RoutedTurnTimeoutError";
+
 // A retried turn resumes the same conversation; it never mints a new one. Classes that a
 // retry cannot fix are refused immediately rather than burning a second provider request.
 export type RoutedTurnRetryPolicy = "none" | "resume";
@@ -122,6 +126,10 @@ export function classifyRoutedTurnFailure(error: unknown): RoutedTurnFailureReas
   const name = error instanceof Error ? error.name : "";
   const text = routedTurnFailureMessage(error).toLowerCase();
 
+  // A turn the app gave up on is not a turn the person cancelled, and the difference decides
+  // whether it is retried. This is why the deadline does not raise `AbortError` or
+  // `TimeoutError`: both of those arrive when someone cancels, and land below.
+  if (name === ROUTED_TURN_TIMEOUT_ERROR_NAME) return "provider_unavailable";
   if (name === "AbortError" || name === "TimeoutError" || /\baborted\b|\bcancell?ed\b/.test(text)) return "cancelled";
 
   if (/needs openrouter_api_key|add it in settings|missing api key|no api key/.test(text)) return "missing_credential";

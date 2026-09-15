@@ -26,10 +26,20 @@ async function loadProviderSession() {
     auth_mode: "chatgpt",
     tokens: { access_token: "at", refresh_token: "rt", id_token: "it", account_id: "acct" },
   }), { mode: 0o600 });
+  const failureOutfile = path.join(temporary, "routed-turn-failure.mjs");
+  await build({
+    entryPoints: [path.join(repoRoot, "source/shared/routed-turn-failure.ts")],
+    outfile: failureOutfile,
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    target: "node22",
+  });
   process.env.CODEX_HOME = codexHome;
   process.env.SAND_DATA_ROOT = path.join(temporary, "sand");
   const module = await import(`${pathToFileURL(outfile).href}?${Date.now()}`);
-  return { module, dispose: () => rm(temporary, { recursive: true, force: true }) };
+  const failure = await import(`${pathToFileURL(failureOutfile).href}?${Date.now()}`);
+  return { module, classify: failure.classifyRoutedTurnFailure, retryDelayMs: failure.routedTurnRetryDelayMs, dispose: () => rm(temporary, { recursive: true, force: true }) };
 }
 
 function sse(body) {
@@ -108,6 +118,77 @@ test("abandoning a routed stream settles its side channels instead of hanging", 
 
     assert.deepEqual(observed, []);
   } finally {
+    await loaded.dispose();
+  }
+});
+
+test("a provider that stops responding loses its turn instead of holding the queue", { timeout: 30_000 }, async () => {
+  const loaded = await loadProviderSession();
+  try {
+    let requestSignal = null;
+    // A response that opens its stream and then says nothing more: the socket stays up, so no
+    // network error ever arrives. The coordinator runs one routed turn per agent at a time, so a
+    // turn that waits here forever silently swallows every later prompt for that agent.
+    const silent = (_url, init) => {
+      requestSignal = init.signal;
+      return Promise.resolve(sse(new ReadableStream({ start() {} })));
+    };
+
+    const started = Date.now();
+    let failure = null;
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(silent, async () => {
+      await assert.rejects(
+        loaded.module.runRoutedProviderText("codex", [{ role: "user", content: "hi" }], { timeoutMs: 500 }),
+        (error) => { failure = error; return true; },
+      );
+    }));
+
+    assert.ok(Date.now() - started < 10_000, `gave up after ${Date.now() - started}ms`);
+    assert.match(failure.message, /stopped responding/);
+    // The provider request has to be closed too, or the turn is abandoned while its socket is not.
+    assert.equal(requestSignal.aborted, true);
+    // `AbortError` and `TimeoutError` are how a person cancelling a turn arrives, and a cancelled
+    // turn is deliberately not retried. A deadline this app imposed is the transient case the
+    // retry exists for, so it must not be mistaken for one.
+    assert.equal(failure.name, "RoutedTurnTimeoutError");
+    assert.equal(loaded.classify(failure), "provider_unavailable");
+    assert.deepEqual(observed, []);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("a routed OpenRouter turn issues one provider request per attempt", { timeout: 30_000 }, async () => {
+  const loaded = await loadProviderSession();
+  process.env.OPENROUTER_API_KEY = "test-key";
+  try {
+    let requests = 0;
+    let refusal = null;
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(async () => {
+      requests += 1;
+      return new Response('{"error":{"message":"rate limit exceeded"}}', { status: 429, headers: { "content-type": "application/json", "retry-after": "2" } });
+    }, async () => {
+      await assert.rejects(
+        loaded.module.runRoutedProviderText("openrouter", [{ role: "user", content: "hi" }]),
+        (error) => { refusal = error; return true; },
+      );
+    }));
+
+    // The SDK reports a refused request as a stream part and leaves its `response` promise
+    // pending, so this used to hang rather than fail, and neither the status the provider sent nor
+    // its pacing ever reached the router.
+    assert.equal(loaded.classify(refusal), "provider_rate_limit");
+    const paced = loaded.retryDelayMs(refusal, () => 0);
+    assert.equal(paced, 2_000, `expected the provider's two second pause, got ${paced}ms`);
+
+    // The AI SDK retries 429s and 5xx twice on its own. The router already retries routed turns,
+    // and paces that retry from `Retry-After`; with both on, one rate-limited turn spent six
+    // provider requests, three of them back to back inside the first attempt before any header
+    // was read.
+    assert.equal(requests, 1);
+    assert.deepEqual(observed, []);
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
     await loaded.dispose();
   }
 });

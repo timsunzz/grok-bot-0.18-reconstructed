@@ -30,6 +30,7 @@ export type CodexDirectOptions = {
   readonly tools?: readonly CodexDirectTool[];
   readonly executeTool?: (tool: CodexDirectTool, args: unknown, toolCallId: string) => Promise<unknown>;
   readonly maxSteps?: number;
+  readonly signal?: AbortSignal;
 };
 
 function record(value: unknown): Loose | null {
@@ -145,6 +146,9 @@ export async function* streamCodexDirectResponses(options: CodexDirectOptions): 
         stream: true,
         store: false,
       }),
+      // Carries the caller's deadline, so abandoning a stalled turn also closes the request it
+      // was waiting on rather than leaving the socket open behind it.
+      ...(options.signal == null ? {} : { signal: options.signal }),
     });
     if (!response.ok) throw await responseError(response);
 
