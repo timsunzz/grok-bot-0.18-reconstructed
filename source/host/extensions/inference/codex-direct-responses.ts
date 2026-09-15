@@ -50,22 +50,30 @@ async function* sseEvents(response: Response): AsyncGenerator<Loose> {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    let boundary: number;
-    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
-      const block = buffer.slice(0, boundary).replaceAll("\r", "");
-      buffer = buffer.slice(boundary + 2);
-      const data = block.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
-      if (data.length === 0 || data === "[DONE]") continue;
-      let parsed: unknown;
-      try { parsed = JSON.parse(data); }
-      catch { throw new Error("Codex direct response contained malformed SSE JSON."); }
-      const event = record(parsed);
-      if (event != null) yield event;
+  let drained = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      let boundary: number;
+      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, boundary).replaceAll("\r", "");
+        buffer = buffer.slice(boundary + 2);
+        const data = block.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
+        if (data.length === 0 || data === "[DONE]") continue;
+        let parsed: unknown;
+        try { parsed = JSON.parse(data); }
+        catch { throw new Error("Codex direct response contained malformed SSE JSON."); }
+        const event = record(parsed);
+        if (event != null) yield event;
+      }
+      if (done) break;
     }
-    if (done) break;
+    drained = true;
+  } finally {
+    // An aborted turn or a mid-stream failure leaves the socket attached to this reader;
+    // cancelling releases it instead of holding the connection until the process exits.
+    if (!drained) await reader.cancel().catch(() => {});
   }
   if (buffer.trim().length > 0 && buffer.trim() !== "data: [DONE]") throw new Error("Codex direct response ended with an incomplete SSE event.");
 }

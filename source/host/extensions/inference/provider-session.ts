@@ -29,7 +29,10 @@ const GROK_ROUTER_SYSTEM_PROMPT = [
 ].join("\n");
 
 function recordRoutedUsage(provider: RoutedProvider, usage: UsageRecord): void {
-  new SandSettingsStore(join(getSandRootDir(), "settings.json")).recordInferenceUsage(provider, usage);
+  // Usage totals are a local activity record, so a settings write failure must never
+  // abort an otherwise successful turn.
+  try { new SandSettingsStore(join(getSandRootDir(), "settings.json")).recordInferenceUsage(provider, usage); }
+  catch {}
 }
 
 function persistedSecrets(): Record<string, string> {
@@ -56,7 +59,34 @@ function providerPrompt(messages: readonly ProviderMessage[]): string {
   return `${GROK_ROUTER_SYSTEM_PROMPT}\n\nContinue this Grok Bot conversation.\n\n${rendered}`;
 }
 
-function deferred<T>() { return Promise.withResolvers<T>(); }
+interface SideChannel<T> { readonly promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void }
+
+// Routed executors expose `usage`, `extendedUsage`, `providerMetadata` and `response` as
+// side channels that a caller is free to ignore. Rejecting an ignored promise raises
+// `unhandledRejection`, which both the coordinator and the host treat as a process crash,
+// so every channel keeps a permanent no-op handler and settles at most once.
+function deferred<T>(): SideChannel<T> {
+  const { promise, resolve, reject } = Promise.withResolvers<T>();
+  promise.catch(() => {});
+  let settled = false;
+  return {
+    promise,
+    resolve: value => { if (!settled) { settled = true; resolve(value); } },
+    reject: error => { if (!settled) { settled = true; reject(error); } },
+  };
+}
+
+// A consumer that stops reading `fullStream` early (an aborted turn) would otherwise leave
+// these channels pending forever, hanging anyone awaiting `response`.
+function settleAbandoned(channels: readonly { reject(error: unknown): void }[], reason: string): void {
+  const error = new Error(reason);
+  for (const channel of channels) channel.reject(error);
+}
+
+function observed<T>(promise: Promise<T>): Promise<T> {
+  promise.catch(() => {});
+  return promise;
+}
 
 function response(text: string, id: string, modelId: string) {
   return { id, modelId, timestamp: new Date(), headers: {}, messages: [{ role: "assistant", content: [{ type: "text", text }] }] };
@@ -171,7 +201,12 @@ function codexExecutor(messages: readonly ProviderMessage[], invocationId: strin
   const resultResponse = deferred<ReturnType<typeof response>>();
   const metadata = deferred<Record<string, unknown>>();
   const model = configuredCodexModel();
-  const tools = codexTools(definitions);
+  const reasoningEffort = configuredCodexReasoningEffort();
+  // Codex tool calls are executed inside `streamCodexDirectResponses`; this executor never
+  // surfaces tool-call parts on `fullStream`, so advertising tools without an executor could
+  // only fail the turn outright. Answering as text is the better degradation.
+  const tools = executeTool == null ? undefined : codexTools(definitions);
+  const channels = [usage, extendedUsage, metadata, resultResponse];
   const fullStream = (async function* () {
     let text = "";
     try {
@@ -179,7 +214,7 @@ function codexExecutor(messages: readonly ProviderMessage[], invocationId: strin
         fetch: codexAuthenticatedFetch(credentials),
         endpoint: "https://chatgpt.com/backend-api/codex/responses",
         model,
-        ...(configuredCodexReasoningEffort() == null ? {} : { reasoningEffort: configuredCodexReasoningEffort()! }),
+        ...(reasoningEffort == null ? {} : { reasoningEffort }),
         instructions: GROK_ROUTER_SYSTEM_PROMPT,
         input: messages.map(message => ({ role: message.role === "assistant" ? "assistant" : "user", content: typeof message.content === "string" ? message.content : JSON.stringify(message.content) })),
         ...(tools == null ? {} : { tools }),
@@ -195,7 +230,8 @@ function codexExecutor(messages: readonly ProviderMessage[], invocationId: strin
         metadata.resolve({ openai: { responseId: event.responseId, direct: true } });
         resultResponse.resolve(response(text, invocationId, model));
       }
-    } catch (error) { usage.reject(error); extendedUsage.reject(error); metadata.reject(error); resultResponse.reject(error); throw error; }
+    } catch (error) { for (const channel of channels) channel.reject(error); throw error; }
+    finally { settleAbandoned(channels, "Codex ended the routed turn before reporting a result."); }
   })();
   return { fullStream, response: resultResponse.promise, usage: usage.promise, extendedUsage: extendedUsage.promise, providerMetadata: metadata.promise, invocationId: Promise.resolve(invocationId) };
 }
@@ -207,6 +243,7 @@ function claudeExecutor(messages: readonly ProviderMessage[], invocationId: stri
   const extendedUsage = deferred<{ inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; maxTokens: number }>();
   const resultResponse = deferred<ReturnType<typeof response>>();
   const metadata = deferred<Record<string, unknown>>();
+  const channels = [usage, extendedUsage, metadata, resultResponse];
   const fullStream = (async function* () {
     try {
       let final: SDKResultMessage | undefined;
@@ -216,13 +253,16 @@ function claudeExecutor(messages: readonly ProviderMessage[], invocationId: stri
       if (final.subtype !== "success") throw new Error(final.errors.join("\n") || `Claude Code failed (${final.subtype}).`);
       const text = final.result;
       if (text.length > 0) yield { type: "text-delta" as const, textDelta: text };
-      const input = final.usage.input_tokens, output = final.usage.output_tokens, cacheRead = final.usage.cache_read_input_tokens ?? 0, cacheWrite = final.usage.cache_creation_input_tokens ?? 0;
+      const reported = (final.usage ?? {}) as Loose;
+      const tokens = (value: unknown): number => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+      const input = tokens(reported.input_tokens), output = tokens(reported.output_tokens), cacheRead = tokens(reported.cache_read_input_tokens), cacheWrite = tokens(reported.cache_creation_input_tokens);
       onUsage?.({ inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite });
       usage.resolve({ promptTokens: input, completionTokens: output, totalTokens: input + output });
       extendedUsage.resolve({ inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite, maxTokens: 0 });
       metadata.resolve({ anthropic: { sessionId: final.session_id, totalCostUsd: final.total_cost_usd } });
       resultResponse.resolve(response(text, invocationId, "claude-code"));
-    } catch (error) { usage.reject(error); extendedUsage.reject(error); metadata.reject(error); resultResponse.reject(error); throw error; }
+    } catch (error) { for (const channel of channels) channel.reject(error); throw error; }
+    finally { settleAbandoned(channels, "Claude Code ended the routed turn before reporting a result."); }
   })();
   return { fullStream, response: resultResponse.promise, usage: usage.promise, extendedUsage: extendedUsage.promise, providerMetadata: metadata.promise, invocationId: Promise.resolve(invocationId) };
 }
@@ -249,9 +289,9 @@ function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: 
   const model: LanguageModelV1 = createOpenAI({ apiKey: openRouterCredential(), baseURL: "https://openrouter.ai/api/v1", compatibility: "compatible", name: "openrouter", headers: { "HTTP-Referer": "https://github.com/grok-bot-reconstructed", "X-Title": "Grok Bot Reconstructed" } }).chat(id as any);
   const tools = toToolSet(definitions, executeTool);
   const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8 });
-  const extendedUsage = result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 0 }));
-  if (onUsage != null) void extendedUsage.then(onUsage);
-  return { fullStream: result.fullStream, response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
+  const extendedUsage = observed(result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 0 })));
+  if (onUsage != null) void extendedUsage.then(onUsage, () => {});
+  return { fullStream: result.fullStream, response: observed(result.response), usage: observed(result.usage), extendedUsage, providerMetadata: observed(result.providerMetadata), invocationId: Promise.resolve(invocationId) };
 }
 
 class ProviderPromptExecutor extends BasePromptExecutor<ProviderMessage> {
