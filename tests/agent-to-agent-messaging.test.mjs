@@ -215,3 +215,66 @@ test("priority messages arriving before dispatch run ahead of the claimed batch"
     await loaded.dispose();
   }
 });
+
+test("a rejected transcript append does not mark the message as displayed", async () => {
+  const loaded = await loadModule();
+  try {
+    const messaging = new loaded.module.AgentToAgentMessaging({
+      sessions: { activeSession: undefined },
+      sessionStore: { markSessionActivity: () => {} },
+      roster: { emitAgentUpdate: () => {} },
+    });
+    const message = {
+      from: { id: "sender", name: "Sender" },
+      text: "persist me",
+      timestampMs: 1,
+    };
+    const session = {
+      id: "recipient",
+      db: {
+        addConversationPartner: () => {},
+        getTranscriptEntries: () => [],
+        appendTranscriptEntry: () => false,
+      },
+    };
+
+    assert.throws(
+      () => messaging.appendAgentInboundEntries(session, [message]),
+      /Failed to persist/,
+    );
+    assert.notEqual(message.isDisplayed, true);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("a queued message keeps retrying while execution is temporarily disabled", async () => {
+  const loaded = await loadModule();
+  try {
+    const execution = { canExecute: false };
+    const messaging = new loaded.module.AgentToAgentMessaging(
+      {
+        execution,
+        sessions: { isAgentGone: () => false },
+      },
+      0,
+    );
+    const message = {
+      from: { id: "sender", name: "Sender" },
+      text: "wake later",
+      timestampMs: 1,
+    };
+    messaging.pendingAgentInbound.set("recipient", [message]);
+    messaging.runAgentInboundWake = async () => true;
+
+    await messaging.reviveForAgentInbound("recipient");
+    assert.equal(messaging.retryingAgentInboundIds.has("recipient"), true);
+    execution.canExecute = true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(messaging.pendingAgentInbound.has("recipient"), false);
+    assert.equal(messaging.retryingAgentInboundIds.has("recipient"), false);
+  } finally {
+    await loaded.dispose();
+  }
+});

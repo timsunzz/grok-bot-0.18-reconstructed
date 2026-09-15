@@ -153,11 +153,12 @@ export class AgentToAgentMessaging {
   }
 
   async reviveForAgentInbound(agentId: string): Promise<void> {
-    if (
-      !this.tm.execution.canExecute ||
-      this.revivingAgentInboundIds.has(agentId)
-    )
+    if (this.revivingAgentInboundIds.has(agentId)) return;
+    if (!this.tm.execution.canExecute) {
+      if ((this.pendingAgentInbound.get(agentId)?.length ?? 0) > 0)
+        this.scheduleAgentInboundRetry(agentId);
       return;
+    }
     this.revivingAgentInboundIds.add(agentId);
     let shouldRetry = false;
     try {
@@ -258,7 +259,6 @@ export class AgentToAgentMessaging {
             try {
               for (const [index, message] of messages.entries()) {
                 if (
-                  index > 0 &&
                   (this.pendingAgentInbound.get(agentId) ?? []).some(
                     (pending) => pending.priority === true,
                   )
@@ -278,6 +278,23 @@ export class AgentToAgentMessaging {
                 const selectedImages = await loadAgentInboundImages(
                   message.images,
                 );
+                if (
+                  (this.pendingAgentInbound.get(agentId) ?? []).some(
+                    (pending) => pending.priority === true,
+                  )
+                ) {
+                  const deferred = messages
+                    .slice(index)
+                    .map((remaining) => ({ ...remaining, isDisplayed: true }));
+                  this.pendingAgentInbound.set(
+                    agentId,
+                    mergeAgentInboundQueue(
+                      this.pendingAgentInbound.get(agentId) ?? [],
+                      deferred,
+                    ),
+                  );
+                  return;
+                }
                 const result = await runner.run(
                   buildAgentInboundWakePrompt(message),
                   {
@@ -364,8 +381,11 @@ export class AgentToAgentMessaging {
         ...(message.images?.length ? { images: message.images } : {}),
       };
       raisesActivity ||= entryRaisesUserActivitySignal(entry);
-      if (isActive) this.tm.appendEntry(entry);
-      else session.db.appendTranscriptEntry(entry);
+      const appended = isActive
+        ? this.tm.appendEntry(entry)
+        : session.db.appendTranscriptEntry(entry);
+      if (appended === false)
+        throw new Error("Failed to persist an inbound agent message");
       message.isDisplayed = true;
     }
     if (!isActive) {
