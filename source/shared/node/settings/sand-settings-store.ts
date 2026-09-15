@@ -166,7 +166,9 @@ export class SandSettingsStore {
     if (outcome.kind === "unreadable") throw outcome.error;
     if (outcome.kind === "corrupt") this.quarantineUnreadable();
     const next = mutator(outcome.settings);
-    if (next === outcome.settings && outcome.kind === "ok") return;
+    // Nothing to change and nothing to repair. A corrupt file is the exception: it has just been
+    // moved aside, so the settings this call read from it have to be written back somewhere.
+    if (next === outcome.settings && outcome.kind !== "corrupt") return;
     this.persist(next);
   }
   getHasSeenOnboarding(): boolean | undefined { return this.load().hasSeenOnboarding; }

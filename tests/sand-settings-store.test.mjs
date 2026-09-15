@@ -85,6 +85,26 @@ test("a missing settings file is a fresh start, not a recovery", async () => {
   }
 });
 
+test("a migration with nothing to migrate writes nothing", async () => {
+  const loaded = await loadStore();
+  try {
+    const settingsPath = path.join(loaded.temporary, "state", "settings.json");
+    const store = new loaded.module.SandSettingsStore(settingsPath);
+
+    // Several of these entry points are repairs that usually find nothing to repair, and they run
+    // on paths a person never asked to save anything on — connecting an MCP server, reading a
+    // notification preference. Creating a file of defaults for them makes a first launch look like
+    // a restored one, and every one of those writes is a chance to lose a file three processes
+    // share.
+    store.migrateMcpCustomInstructionToServerId({ serverId: "srv", displayName: "Gmail" });
+    store.deleteMcpCustomInstruction("Gmail");
+
+    assert.deepEqual(await readdir(path.dirname(settingsPath)).catch(() => []), []);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("a read that fails is not mistaken for corruption", async () => {
   const loaded = await loadStore();
   try {
