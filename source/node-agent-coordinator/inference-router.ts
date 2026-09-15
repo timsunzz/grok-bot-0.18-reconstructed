@@ -185,87 +185,99 @@ export function createCoordinatorInferenceRouter(options: {
     const userEntry = { kind: "message", id: `t${turn}u`, role: "user", content: prompt, ...(richText === undefined ? {} : { richText }), isStreaming: false, timestampMs, clientNonce };
     const withUser = await append(agentId, [{ provider, role: "user", content: prompt, ...(richText === undefined ? {} : { richText }), id: userEntry.id, clientNonce, timestampMs }]);
     emitTranscript(agentId, "appended", userEntry);
+    // Everything from here on runs inside the activity pulse, so everything from here on has to be
+    // inside the block that clears it. Bringing up the tool bridge and listing the plugins are both
+    // remote calls that can fail, and each one used to leave the agent row composing for the rest of
+    // the session.
     const endActivity = await beginActivity(agentId);
-    // The shipped transcript intentionally suppresses its activity row as soon as
-    // the first streamed assistant entry arrives. Direct providers can produce that
-    // first delta in the same renderer reconciliation window as the roster update,
-    // making the genuine composing state imperceptible. The shipped virtualized
-    // transcript needs roughly 350 ms to materialize its trailing activity row,
-    // so keep the composing state authoritative long enough for a clearly
-    // perceptible rendered interval before normal token streaming begins.
-    await new Promise<void>(resolve => setTimeout(resolve, 1_200));
-    const messages = (withUser.agents[agentId] ?? []).map(entry => ({ role: entry.role, content: entry.content }));
-    let content: string;
-    const assistantTimestampMs = now();
-    const assistantId = `t${turn}s0`;
-    let assistantStreamStarted = false;
-    const emitAssistant = (nextContent: string, streaming: boolean, failureReason?: RoutedTurnFailureReason) => {
-      const entry = { kind: "send-message", id: assistantId, message: { type: "text", content: nextContent }, streaming, timestampMs: assistantTimestampMs, ...(failureReason === undefined ? {} : { failureReason }) };
-      emitTranscript(agentId, assistantStreamStarted ? "updated" : "appended", entry);
-      assistantStreamStarted = true;
-    };
-    // Every routed tool call funnels through here, whichever transport carries it, so the
-    // breaker and the retry gate see one accounting of what this turn has already done.
-    const breaker = createRoutedToolBreaker();
-    let appliedWriteEffect = false;
-    const callRoutedTool = async (definition: Record<string, any>, toolArgs: unknown, toolCallId: string): Promise<unknown> => {
-      const server = typeof definition.providerIdentifier === "string" ? definition.providerIdentifier : "";
-      const refusal = breaker.refusal(server);
-      if (refusal != null) return { result: { case: "error", value: { error: refusal } } };
-      // Marked before dispatching, not after: a write whose transport died on the way back may
-      // still have landed, and that is exactly the case a retry must not replay.
-      if (!routedToolIsReadOnly(definition)) appliedWriteEffect = true;
-      let value: unknown;
-      try {
-        value = await options.dispatchRemote("executeRoutedMcpTool", {
-          providerIdentifier: definition.providerIdentifier,
-          name: definition.name,
-          toolName: definition.toolName,
-          args: toolArgs,
-          toolCallId,
-          agentId,
-        });
-      } catch (error) { breaker.recordFailure(server, "unreachable"); throw error; }
-      if (routedToolCallFailed(value)) breaker.recordFailure(server, "rejected");
-      else breaker.recordSuccess(server);
-      return value;
-    };
-    const bridge = provider === "claude-code" ? await createRoutedMcpBridge({
-      listTools: () => options.dispatchRemote("listRoutedMcpTools", {}),
-      callTool: tool => callRoutedTool(tool, tool.args, tool.toolCallId),
-    }) : null;
-    const directTools = bridge == null ? await options.dispatchRemote("listRoutedMcpTools", {}) : undefined;
-    const tools = Array.isArray(directTools) ? directTools as Record<string, any>[] : undefined;
-    const onTextDelta = (_delta: string, accumulated: string) => emitAssistant(accumulated, true);
-    const attempt = () => runRoutedProviderText(provider, messages, bridge == null ? {
-      ...(tools === undefined ? {} : { tools }),
-      executeTool: callRoutedTool,
-      onTextDelta,
-    } : { mcpServerUrl: bridge.url, onTextDelta });
+    let bridge: Awaited<ReturnType<typeof createRoutedMcpBridge>> | null = null;
     try {
-      try { content = await attempt(); }
-      catch (error) {
-        // One retry, and only for classes a retry can actually fix on a turn that has not
-        // already changed something. The same turn resumes; a retried turn never mints a new
-        // one, and its assistant entry is rewritten rather than appended twice.
-        if (routedTurnRetryPolicy(classifyRoutedTurnFailure(error), { appliedWriteEffect }) !== "resume") throw error;
-        const delayMs = routedTurnRetryDelayMs(error);
-        if (delayMs == null) throw error;
-        await new Promise<void>(resolve => setTimeout(resolve, delayMs));
-        content = await attempt();
+      // The shipped transcript intentionally suppresses its activity row as soon as
+      // the first streamed assistant entry arrives. Direct providers can produce that
+      // first delta in the same renderer reconciliation window as the roster update,
+      // making the genuine composing state imperceptible. The shipped virtualized
+      // transcript needs roughly 350 ms to materialize its trailing activity row,
+      // so keep the composing state authoritative long enough for a clearly
+      // perceptible rendered interval before normal token streaming begins.
+      await new Promise<void>(resolve => setTimeout(resolve, 1_200));
+      const messages = (withUser.agents[agentId] ?? []).map(entry => ({ role: entry.role, content: entry.content }));
+      let content: string;
+      const assistantTimestampMs = now();
+      const assistantId = `t${turn}s0`;
+      let assistantStreamStarted = false;
+      const emitAssistant = (nextContent: string, streaming: boolean, failureReason?: RoutedTurnFailureReason) => {
+        const entry = { kind: "send-message", id: assistantId, message: { type: "text", content: nextContent }, streaming, timestampMs: assistantTimestampMs, ...(failureReason === undefined ? {} : { failureReason }) };
+        emitTranscript(agentId, assistantStreamStarted ? "updated" : "appended", entry);
+        assistantStreamStarted = true;
+      };
+      // Every routed tool call funnels through here, whichever transport carries it, so the
+      // breaker and the retry gate see one accounting of what this turn has already done.
+      const breaker = createRoutedToolBreaker();
+      let appliedWriteEffect = false;
+      const callRoutedTool = async (definition: Record<string, any>, toolArgs: unknown, toolCallId: string): Promise<unknown> => {
+        const server = typeof definition.providerIdentifier === "string" ? definition.providerIdentifier : "";
+        const refusal = breaker.refusal(server);
+        if (refusal != null) return { result: { case: "error", value: { error: refusal } } };
+        // Marked before dispatching, not after: a write whose transport died on the way back may
+        // still have landed, and that is exactly the case a retry must not replay.
+        if (!routedToolIsReadOnly(definition)) appliedWriteEffect = true;
+        let value: unknown;
+        try {
+          value = await options.dispatchRemote("executeRoutedMcpTool", {
+            providerIdentifier: definition.providerIdentifier,
+            name: definition.name,
+            toolName: definition.toolName,
+            args: toolArgs,
+            toolCallId,
+            agentId,
+          });
+        } catch (error) { breaker.recordFailure(server, "unreachable"); throw error; }
+        if (routedToolCallFailed(value)) breaker.recordFailure(server, "rejected");
+        else breaker.recordSuccess(server);
+        return value;
+      };
+      bridge = provider === "claude-code" ? await createRoutedMcpBridge({
+        listTools: () => options.dispatchRemote("listRoutedMcpTools", {}),
+        callTool: tool => callRoutedTool(tool, tool.args, tool.toolCallId),
+      }) : null;
+      const directTools = bridge == null ? await options.dispatchRemote("listRoutedMcpTools", {}) : undefined;
+      const tools = Array.isArray(directTools) ? directTools as Record<string, any>[] : undefined;
+      const onTextDelta = (_delta: string, accumulated: string) => emitAssistant(accumulated, true);
+      const mcpServerUrl = bridge?.url;
+      const attempt = () => runRoutedProviderText(provider, messages, mcpServerUrl == null ? {
+        ...(tools === undefined ? {} : { tools }),
+        executeTool: callRoutedTool,
+        onTextDelta,
+      } : { mcpServerUrl, onTextDelta });
+      try {
+        try { content = await attempt(); }
+        catch (error) {
+          // One retry, and only for classes a retry can actually fix on a turn that has not
+          // already changed something. The same turn resumes; a retried turn never mints a new
+          // one, and its assistant entry is rewritten rather than appended twice.
+          if (routedTurnRetryPolicy(classifyRoutedTurnFailure(error), { appliedWriteEffect }) !== "resume") throw error;
+          const delayMs = routedTurnRetryDelayMs(error);
+          if (delayMs == null) throw error;
+          await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+          content = await attempt();
+        }
+      } catch (error) {
+        // Reported here rather than by the caller so the failure keeps this turn's own id
+        // instead of inventing one.
+        const reason = classifyRoutedTurnFailure(error);
+        const failure = formatRoutedTurnFailure(error, reason, { appliedWriteEffect });
+        await append(agentId, [{ provider, role: "assistant", content: failure, id: assistantId, failureReason: reason, timestampMs: assistantTimestampMs }]);
+        emitAssistant(failure, false, reason);
+        return { accepted: true, clientNonce, provider };
       }
-    } catch (error) {
-      // Reported here rather than by the caller so the failure keeps this turn's own id
-      // instead of inventing one.
-      const reason = classifyRoutedTurnFailure(error);
-      const failure = formatRoutedTurnFailure(error, reason, { appliedWriteEffect });
-      await append(agentId, [{ provider, role: "assistant", content: failure, id: assistantId, failureReason: reason, timestampMs: assistantTimestampMs }]);
-      emitAssistant(failure, false, reason);
+      await append(agentId, [{ provider, role: "assistant", content, id: assistantId, timestampMs: assistantTimestampMs }]);
+      emitAssistant(content, false);
       return { accepted: true, clientNonce, provider };
-    } finally { endActivity(); await bridge?.close(); }
-    await append(agentId, [{ provider, role: "assistant", content, id: assistantId, timestampMs: assistantTimestampMs }]);
-    emitAssistant(content, false);
-    return { accepted: true, clientNonce, provider };
+    } finally {
+      // Neither of these may replace what the turn is already reporting on its way out.
+      try { endActivity(); } catch {}
+      await bridge?.close().catch(() => {});
+    }
   };
 
   return {

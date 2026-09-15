@@ -157,7 +157,7 @@ test("a turn that fails before reaching the provider still answers its own promp
       dispatchRemote: async (method) => {
         if (method === "getAgentTranscriptTail") return { entries: [] };
         if (method === "listRoutedMcpTools") throw new Error("the plugin host is not running");
-        if (method === "listAgents") return [];
+        if (method === "listAgents") return [{ id: "agent-5", isRunning: false }];
         return null;
       },
       now: () => 1_000,
@@ -170,6 +170,17 @@ test("a turn that fails before reaching the provider still answers its own promp
     // leaving that prompt looking permanently unanswered.
     assert.deepEqual(entries.map((entry) => entry.id), ["t0u", "t0s0"]);
     assert.match(entries[1].content, /the plugin host is not running/);
+
+    // The turn also has to stop claiming to be running. The composing state is republished four
+    // times a second precisely so a stale remote roster cannot erase it, so a failure that skips
+    // the clear leaves that agent composing for the rest of the session.
+    const rosters = () => events.filter((event) => event.family === "agents");
+    const published = rosters().length;
+    const settled = rosters().at(-1).payload.agents.find((agent) => agent.id === "agent-5");
+    assert.equal(settled.isRunning, false);
+    assert.equal(settled.currentActivity, undefined);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal(rosters().length, published, "the activity pulse has to have stopped");
   } finally {
     await loaded.dispose();
   }
