@@ -98,6 +98,15 @@ tool execution across routed conversations.
 providers that return usage data. These figures are activity records, not an
 authoritative provider invoice.
 
+Routed turns have no server-side transcript to resume from, so their failure
+handling is enforced locally: every failure carries a reason code, a prompt
+resubmitted with the same nonce does not run twice, a retry is paced by the
+provider that refused it, and a turn that already ran a plugin write is reported
+rather than replayed. See
+[docs/ROUTED-TURN-RELIABILITY.md](docs/ROUTED-TURN-RELIABILITY.md), which also
+records what that model borrows from Hermes Agent's Bot Mode and where the two
+designs diverge.
+
 ### Local Docker sandbox
 
 The Router page also has a **Use local Docker VM** toggle. When enabled, Grok
