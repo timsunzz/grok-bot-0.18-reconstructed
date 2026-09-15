@@ -90,11 +90,20 @@ test("an oversized body is refused without reading the rest of it", { timeout: 3
     bridge = await loaded.module.createRoutedMcpBridge({ listTools: async () => [], callTool: async () => ({}) });
 
     const observed = await withoutUnhandledRejections(async () => {
-      const answered = await request(bridge.url, { body: `{"padding":"${"x".repeat(1_100_000)}"}` });
+      // Announces eight megabytes and sends only the first one. A bridge that waited for the body
+      // it was promised before refusing it would never answer this at all, and the sender would
+      // keep filling a socket whose request nobody is reading.
+      const answered = await request(bridge.url, {
+        body: `{"padding":"${"x".repeat(1_100_000)}"}`,
+        announcedLength: 8_000_000,
+      });
       assert.match(answered, /^HTTP\/1\.1 413/);
     });
 
     assert.deepEqual(observed, []);
+
+    const stillServing = await request(bridge.url, { body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "initialize" }) });
+    assert.match(stillServing, /"serverInfo"/);
   } finally {
     await bridge?.close();
     await loaded.dispose();

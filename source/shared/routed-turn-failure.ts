@@ -134,7 +134,7 @@ export function classifyRoutedTurnFailure(error: unknown): RoutedTurnFailureReas
 
   if (/needs openrouter_api_key|add it in settings|missing api key|no api key/.test(text)) return "missing_credential";
   if (/is not installed|could not be found on this machine|command not found|enoent/.test(text)) return "provider_not_installed";
-  if (/not signed in|login expired|run `codex login`|unauthorized|invalid api key|invalid_api_key|authentication/.test(text)) return "provider_auth";
+  if (/not signed in|login expired|run `codex login`|unauthorized|invalid api key|invalid_api_key|authentication|credentials must be/.test(text)) return "provider_auth";
   if (/quota|insufficient_quota|billing|payment required|out of credit|credit balance/.test(text)) return "provider_quota";
   if (/rate limit|rate_limit|too many requests|overloaded/.test(text)) return "provider_rate_limit";
   if (/context (?:length|window)|too many tokens|maximum context|context_length_exceeded|prompt is too long/.test(text)) return "context_overflow";

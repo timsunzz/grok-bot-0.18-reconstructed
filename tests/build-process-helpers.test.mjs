@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { DEFAULT_RUN_TIMEOUT_MS, capture, run } = await import(path.join(repoRoot, "scripts/lib/process.mjs"));
 const { SYSTEM_TOOLS, assertMacOsHost } = await import(path.join(repoRoot, "scripts/lib/system-tools.mjs"));
+const { DETACH_RETRY_DELAYS_MS, detachQuietly } = await import(path.join(repoRoot, "scripts/lib/dmg.mjs"));
 
 test("a build subprocess that never exits fails on its deadline instead of hanging", async () => {
   const started = Date.now();
@@ -59,7 +60,12 @@ test("every entry-point build script states its platform precondition before doi
     "scripts/package-fidelity-diagnostic.mjs",
   ]) {
     const source = await readFile(path.join(repoRoot, script), "utf8");
-    assert.match(source, /assertMacOsHost\(/, `${script} must assert its platform precondition`);
+    const guard = source.indexOf("assertMacOsHost(\"");
+    assert.notEqual(guard, -1, `${script} must assert its platform precondition`);
+    // The guard exists to be reached before a 150 MB download or a native rebuild, so its
+    // position is the point: after the first `await` it is a comment.
+    const firstAwait = source.search(/^\s*(?:await|const .* = await)\s/m);
+    assert.ok(guard < firstAwait || firstAwait === -1, `${script} does work before asserting its platform precondition`);
   }
   // Every entry in SYSTEM_TOOLS is an absolute macOS path, so the single guard stays sufficient
   // as tools are added.
@@ -67,10 +73,27 @@ test("every entry-point build script states its platform precondition before doi
 });
 
 test("the release image is detached with retries and never masks the original failure", async () => {
+  // Spotlight indexes an image it has just seen appear, and `hdiutil detach` fails while anything
+  // holds the volume, so the first attempt losing is the common case rather than the exception.
+  const attempts = [];
+  const busyUntilThirdTry = async (mountRoot) => {
+    attempts.push(mountRoot);
+    if (attempts.length < 3) throw new Error("hdiutil: couldn't unmount: Resource busy");
+  };
+
+  assert.equal(await detachQuietly("/Volumes/scratch", { detach: busyUntilThirdTry, delaysMs: [0, 0, 0] }), null);
+  assert.equal(attempts.length, 3);
+
+  // It runs from a `finally`. A throw there would replace whatever went wrong inside the block and
+  // skip the cleanup after it, leaving the image attached and unexplained, so the failure comes
+  // back as a value for the caller to report.
+  const failure = await detachQuietly("/Volumes/scratch", {
+    detach: async () => { throw new Error("hdiutil: couldn't unmount: Resource busy"); },
+    delaysMs: [0, 0, 0],
+  });
+  assert.match(String(failure), /Resource busy/);
+
+  assert.equal(await detachQuietly("/Volumes/scratch", { detach: async () => {}, delaysMs: DETACH_RETRY_DELAYS_MS }), null);
   const source = await readFile(path.join(repoRoot, "scripts/bootstrap-runtime.mjs"), "utf8");
-  // A throw from `finally` replaced whatever went wrong inside the block and skipped the cleanup
-  // after it, leaving the image attached with no explanation.
-  assert.match(source, /async function detachQuietly/);
-  assert.doesNotMatch(source, /if \(attached\) await run\(SYSTEM_TOOLS\.hdiutil, \["detach"/);
   assert.match(source, /Could not detach the release image/);
 });

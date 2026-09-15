@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -54,32 +55,67 @@ test("every routed failure the router itself raises classifies to a known reason
   }
 });
 
-test("an aborted turn is never mistaken for a provider failure", async () => {
-  const { classifyRoutedTurnFailure, routedTurnRetryPolicy } = await loadModule();
+test("no failure the routed paths raise degrades to an unclassified reason", async () => {
+  const { classifyRoutedTurnFailure } = await loadModule();
+  // The table above is transcribed by hand, so it keeps passing when a message is reworded in the
+  // source and quietly stops classifying. These are the literals themselves, read out of the
+  // routed inference paths at test time.
+  const sources = [
+    "source/host/extensions/inference/codex-direct-responses.ts",
+    "source/host/extensions/inference/provider-session.ts",
+    "source/node-agent-coordinator/inference-router.ts",
+  ];
+  const thrown = [];
+  for (const relative of sources) {
+    const source = await readFile(path.join(repoRoot, relative), "utf8");
+    for (const match of source.matchAll(/throw new Error\((?:`|")([^`"$]+)(?:`|")\)/g)) thrown.push([relative, match[1]]);
+  }
+
+  assert.ok(thrown.length >= 8, `expected the routed paths to raise several classifiable failures, found ${thrown.length}`);
+  for (const [relative, message] of thrown) {
+    assert.notEqual(classifyRoutedTurnFailure(new Error(message)), "unknown", `${relative} raises "${message}", which no rule recognises`);
+  }
+});
+
+test("a turn the person cancelled and a turn the app gave up on are not the same failure", async () => {
+  const { ROUTED_TURN_TIMEOUT_ERROR_NAME, classifyRoutedTurnFailure, routedTurnRetryPolicy } = await loadModule();
   const aborted = new Error("The operation was aborted.");
   aborted.name = "AbortError";
   assert.equal(classifyRoutedTurnFailure(aborted), "cancelled");
   assert.equal(routedTurnRetryPolicy("cancelled"), "none");
-});
 
-test("only failures a retry can fix are retried", async () => {
-  const { ROUTED_TURN_FAILURE_REASONS, routedTurnRetryPolicy } = await loadModule();
-  const retried = ROUTED_TURN_FAILURE_REASONS.filter((reason) => routedTurnRetryPolicy(reason) === "resume");
-
-  assert.deepEqual(retried, ["provider_rate_limit", "provider_server_error", "provider_unavailable", "malformed_response"]);
-  // Retrying these can only burn a second provider request: nothing about them changes between
-  // two back-to-back attempts.
-  for (const reason of ["missing_credential", "provider_not_installed", "provider_auth", "provider_quota", "context_overflow", "tool_step_limit", "invalid_request", "cancelled", "unknown"]) {
-    assert.equal(routedTurnRetryPolicy(reason), "none", `${reason} should not be retried`);
-  }
+  // A deadline this app imposed is the transient case the retry exists for. Borrowing `AbortError`
+  // or `TimeoutError` for it would land it in the one class that suppresses that retry.
+  const timedOut = new Error("codex stopped responding: Grok Bot timed out this turn after 600s.");
+  timedOut.name = ROUTED_TURN_TIMEOUT_ERROR_NAME;
+  assert.equal(classifyRoutedTurnFailure(timedOut), "provider_unavailable");
+  assert.equal(routedTurnRetryPolicy("provider_unavailable"), "resume");
 });
 
 test("every reason in the vocabulary has a decided retry policy", async () => {
   const { ROUTED_TURN_FAILURE_REASONS, routedTurnRetryPolicy } = await loadModule();
-  // A reason added without deciding what a retry should do with it would otherwise inherit
-  // whatever `includes` happens to answer.
+  // Written out per reason rather than derived from the retryable list, so a reason added without
+  // deciding what a retry should do with it fails here instead of inheriting an answer. A retry
+  // resumes only where a second identical request could plausibly land differently.
+  const expected = {
+    missing_credential: "none",
+    provider_not_installed: "none",
+    provider_auth: "none",
+    provider_quota: "none",
+    provider_rate_limit: "resume",
+    provider_server_error: "resume",
+    provider_unavailable: "resume",
+    context_overflow: "none",
+    tool_step_limit: "none",
+    malformed_response: "resume",
+    invalid_request: "none",
+    cancelled: "none",
+    unknown: "none",
+  };
+
+  assert.deepEqual([...ROUTED_TURN_FAILURE_REASONS].sort(), Object.keys(expected).sort());
   for (const reason of ROUTED_TURN_FAILURE_REASONS) {
-    assert.ok(["none", "resume"].includes(routedTurnRetryPolicy(reason)), `${reason} has no policy`);
+    assert.equal(routedTurnRetryPolicy(reason), expected[reason], `${reason} has the wrong retry policy`);
   }
 });
 

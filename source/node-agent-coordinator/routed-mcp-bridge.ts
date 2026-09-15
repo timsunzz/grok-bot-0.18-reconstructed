@@ -34,6 +34,13 @@ function mcpResult(value: unknown): Record<string, unknown> {
 
 const MAX_BODY_BYTES = 1_048_576;
 
+// A client that hangs up mid-upload rejects the request iterator with one of these. It is the
+// normal end of an abandoned tool call, not a fault worth reporting.
+function isClientDisconnect(error: unknown): boolean {
+  const code = typeof error === "object" && error != null ? (error as { code?: unknown }).code : undefined;
+  return code === "ECONNRESET" || code === "ECONNABORTED" || code === "ERR_STREAM_PREMATURE_CLOSE";
+}
+
 export async function createRoutedMcpBridge(deps: {
   readonly listTools: () => Promise<unknown>;
   readonly callTool: (args: Tool & { readonly args: unknown; readonly toolCallId: string }) => Promise<unknown>;
@@ -88,7 +95,10 @@ export async function createRoutedMcpBridge(deps: {
     // A client that disconnects mid-upload rejects the request iterator, and the coordinator exits
     // on `unhandledRejection`, so one abandoned tool call used to take the whole process down.
     // Whatever went wrong, this connection is the only casualty.
-    void serve(request, response).catch(() => {
+    void serve(request, response).catch((error: unknown) => {
+      // A disconnect is expected and uninteresting; anything else is a bug in `serve`, and this
+      // bridge has no logger, so stderr is the trail. The coordinator's stderr is captured.
+      if (!isClientDisconnect(error)) console.error("[routed-mcp-bridge] request handler failed:", error);
       if (response.writableEnded) return;
       try { response.writeHead(500).end(); } catch { response.destroy(); }
     });

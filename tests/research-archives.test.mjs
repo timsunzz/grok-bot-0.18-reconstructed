@@ -60,7 +60,12 @@ test("preserved 0.18.0 installers match the exact public release inventory", asy
 
   const pointers = await unpulledLfsPointers(files);
   if (pointers.length > 0) {
-    t.skip(`Git LFS objects are not present (${pointers.join(", ")}). Run \`git lfs install && git lfs pull\` to verify the preserved installers.`);
+    const advice = `Git LFS objects are not present (${pointers.join(", ")}). Run \`git lfs install && git lfs pull\` to verify the preserved installers.`;
+    // A checkout without the objects cannot verify them, and saying so beats reporting a bare size
+    // mismatch. On CI it has to fail: a green run that quietly skipped this check would mean the
+    // archived installers are never verified at all, which is the whole point of preserving them.
+    if (process.env.CI != null && process.env.CI !== "" && process.env.CI !== "false") assert.fail(advice);
+    t.skip(advice);
     return;
   }
 

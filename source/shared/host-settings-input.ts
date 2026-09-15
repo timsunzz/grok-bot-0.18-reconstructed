@@ -1,17 +1,10 @@
 import type { SidebarSection } from "./sidebar-sections.js";
 
-/**
- * Host settings reach the store from the renderer over IPC and from the desktop over the
- * coordinator's RPC, so neither their shape nor their element types are guaranteed. The stores
- * themselves assume well-typed input: `setPinnedAgentIds` spreads its argument, and
- * `SidebarSections.normalize` calls `.trim()` on every id, so a malformed payload either throws
- * from deep inside normalization — abandoning the rest of a batched update half-applied — or
- * persists nonsense such as a bare string exploded into one agent id per character.
- *
- * These parsers reject a whole field rather than salvaging part of it. A caller that gets `null`
- * keeps whatever is already stored, which is the same shape `parseAgentModel` uses on the
- * Electron edge for models.
- */
+// Host settings arrive from the renderer over IPC and from the desktop over the coordinator's RPC,
+// where neither their shape nor their element types are guaranteed, and the stores behind them
+// assume well-typed input. These parsers reject a whole field rather than salvaging part of it: a
+// caller that gets `null` keeps what is already stored. `SidebarSections.parse` is the shipped
+// app's coercing reader and stays as it is; untrusted input needs the refusal, not the coercion.
 export function parseAgentIdList(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
   const ids: string[] = [];

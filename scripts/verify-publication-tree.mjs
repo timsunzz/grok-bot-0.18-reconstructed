@@ -15,17 +15,22 @@ const scratch = await mkdtemp(path.join(os.tmpdir(), "grok-bot-publication-"));
 const archive = path.join(scratch, "repository.tar");
 const exported = path.join(scratch, "exported");
 
-// Git adopts the invoking user's global and system configuration, and two settings in it change
-// what this comparison sees. `core.excludesFile` makes `git add --all` stage fewer files in the
-// scratch repository, and `core.autocrlf` makes `git archive` rewrite line endings on the way out,
-// so every text blob comes back with a different hash and the trees differ while the file lists
-// match exactly. Either reports a publication defect that exists only on that machine, so every
-// git call here runs against a fixed configuration.
+// Git adopts the invoking user's configuration, and two settings in it change what this comparison
+// sees. `core.excludesFile` makes `git add --all` stage fewer files in the scratch repository, and
+// `core.autocrlf` makes `git archive` rewrite line endings on the way out, so every text blob comes
+// back with a different hash and the trees differ while the file lists match exactly. Either
+// reports a publication defect that exists only on that machine.
+//
+// The environment variables cover global and system configuration. Both settings can equally live
+// in this repository's own `.git/config`, which no environment variable can turn off, so the two
+// that matter are also pinned per invocation — `-c` outranks every configuration file.
 const isolated = {
   env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_ATTR_NOSYSTEM: "1" },
 };
 const inRepo = { ...isolated, cwd: repoRoot };
 const inExport = { ...isolated, cwd: exported };
+const fixedConfig = ["-c", "core.autocrlf=false", "-c", "core.excludesFile=", "-c", "core.eol=lf"];
+const gitArgs = (args) => [...fixedConfig, ...args];
 
 async function requireExported(relative) {
   const target = path.join(exported, relative);
@@ -37,22 +42,21 @@ async function requireExported(relative) {
   if ((await stat(target)).size === 0) {
     throw new Error(`Fresh publication export truncated ${relative} to zero bytes.`);
   }
-  return await readFile(target);
 }
 
 try {
-  await run(git, ["archive", "--format=tar", `--output=${archive}`, "HEAD"], inRepo);
+  await run(git, gitArgs(["archive", "--format=tar", `--output=${archive}`, "HEAD"]), inRepo);
   await mkdir(exported);
   await run(tar, ["-xf", archive, "-C", exported]);
   // An empty template keeps sample hooks out of the scratch repository.
-  await run(git, ["init", "--quiet", "--template="], inExport);
-  await run(git, ["add", "--all"], inExport);
+  await run(git, gitArgs(["init", "--quiet", "--template="]), inExport);
+  await run(git, gitArgs(["add", "--all"]), inExport);
 
   const [sourceTree, exportedTree, sourceFiles, exportedFiles] = await Promise.all([
-    capture(git, ["rev-parse", "HEAD^{tree}"], inRepo),
-    capture(git, ["write-tree"], inExport),
-    capture(git, ["ls-tree", "-r", "--name-only", "HEAD"], inRepo),
-    capture(git, ["ls-files"], inExport),
+    capture(git, gitArgs(["rev-parse", "HEAD^{tree}"]), inRepo),
+    capture(git, gitArgs(["write-tree"]), inExport),
+    capture(git, gitArgs(["ls-tree", "-r", "--name-only", "HEAD"]), inRepo),
+    capture(git, gitArgs(["ls-files"]), inExport),
   ]);
   if (sourceTree !== exportedTree) {
     const sourceSet = new Set(sourceFiles.split("\n").filter(Boolean));

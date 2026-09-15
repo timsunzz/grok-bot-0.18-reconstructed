@@ -6,6 +6,7 @@ import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { archivedDmg, cachedDmg, cachedRuntimeApp, dmgSha256, dmgUrl } from "./lib/config.mjs";
+import { detachQuietly } from "./lib/dmg.mjs";
 import { run } from "./lib/process.mjs";
 import { cacheRuntimeFromApp, hydrateSourcePayloadFromRuntime, validateRuntimeApp } from "./lib/runtime.mjs";
 import { SYSTEM_TOOLS, assertMacOsHost } from "./lib/system-tools.mjs";
@@ -67,21 +68,6 @@ async function downloadDmg() {
     await rm(partial, { force: true });
     throw error;
   }
-}
-
-// `hdiutil detach` fails while anything still holds the volume, which on a desktop is routinely
-// Spotlight indexing the image it has just seen appear. Retry before giving up.
-async function detachQuietly(mountRoot) {
-  for (const delayMs of [0, 500, 2_000]) {
-    if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
-    try {
-      await run(SYSTEM_TOOLS.hdiutil, ["detach", mountRoot]);
-      return null;
-    } catch (error) {
-      if (delayMs === 2_000) return error;
-    }
-  }
-  return null;
 }
 
 async function extractRuntime() {
