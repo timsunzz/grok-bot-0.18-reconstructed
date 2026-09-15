@@ -66,9 +66,19 @@ type CodexCredentials = { accessToken: string; refreshToken: string; idToken: st
 
 function codexCredentials(): CodexCredentials {
   const path = join(process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"), "auth.json");
-  const stat = lstatSync(path);
+  let stat: { isFile(): boolean; isSymbolicLink(): boolean; mode: number };
+  try {
+    stat = lstatSync(path);
+  } catch {
+    throw new Error("Codex is not signed in. Run `codex login`, then reopen Grok Bot.");
+  }
   if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) throw new Error("Codex login credentials must be a private direct regular file.");
-  const parsed = JSON.parse(readFileSync(path, "utf8")) as Loose;
+  let parsed: Loose;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8")) as Loose;
+  } catch {
+    throw new Error("Codex login credentials are corrupted. Run `codex login` again.");
+  }
   const accessToken = parsed?.tokens?.access_token;
   const refreshToken = parsed?.tokens?.refresh_token;
   const idToken = parsed?.tokens?.id_token;
@@ -116,6 +126,13 @@ async function refreshCodexCredentials(current: CodexCredentials): Promise<Codex
 
 function codexAuthenticatedFetch(initial: CodexCredentials): typeof fetch {
   let credentials = initial;
+  // Singleflight concurrent 401 refreshes so only one refresh request runs
+  // and parallel turns share the refreshed credentials.
+  let refresh: Promise<CodexCredentials> | null = null;
+  const refreshOnce = (): Promise<CodexCredentials> => {
+    refresh ??= refreshCodexCredentials(credentials).finally(() => { refresh = null; });
+    return refresh;
+  };
   return async (input, init) => {
     const perform = () => {
       const headers = new Headers(init?.headers);
@@ -125,17 +142,33 @@ function codexAuthenticatedFetch(initial: CodexCredentials): typeof fetch {
     };
     let result = await perform();
     if (result.status !== 401) return result;
-    credentials = await refreshCodexCredentials(credentials);
+    credentials = await refreshOnce();
     result = await perform();
     return result;
   };
+}
+
+function stripTomlComments(config: string): string {
+  return config.split("\n").map(line => {
+    let inQuote: string | null = null;
+    for (let i = 0; i < line.length; i += 1) {
+      const ch = line[i]!;
+      if (inQuote != null) {
+        if (ch === inQuote) inQuote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { inQuote = ch; continue; }
+      if (ch === "#") return line.slice(0, i);
+    }
+    return line;
+  }).join("\n");
 }
 
 function configuredCodexModel(): string {
   const selected = process.env.SAND_CODEX_MODEL?.trim();
   if (selected) return selected;
   try {
-    const config = readFileSync(join(process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"), "config.toml"), "utf8");
+    const config = stripTomlComments(readFileSync(join(process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"), "config.toml"), "utf8"));
     return /^\s*model\s*=\s*["']([^"']+)["']/m.exec(config)?.[1]?.trim() || "gpt-5.4";
   } catch { return "gpt-5.4"; }
 }
@@ -144,7 +177,7 @@ function configuredCodexReasoningEffort(): "minimal" | "low" | "medium" | "high"
   const selected = process.env.SAND_CODEX_REASONING_EFFORT?.trim();
   if (selected === "minimal" || selected === "low" || selected === "medium" || selected === "high" || selected === "xhigh") return selected;
   try {
-    const config = readFileSync(join(process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"), "config.toml"), "utf8");
+    const config = stripTomlComments(readFileSync(join(process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"), "config.toml"), "utf8"));
     const value = /^\s*model_reasoning_effort\s*=\s*["']([^"']+)["']/m.exec(config)?.[1]?.trim();
     return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" ? value : undefined;
   } catch { return undefined; }
@@ -273,6 +306,7 @@ export async function runRoutedProviderText(provider: RoutedProvider, messages: 
   readonly tools?: readonly Loose[];
   readonly executeTool?: RoutedToolExecutor;
   readonly onTextDelta?: (delta: string, accumulated: string) => void;
+  readonly timeoutMs?: number;
 }): Promise<string> {
   const invocationId = crypto.randomUUID();
   const onUsage = (usage: UsageRecord) => recordRoutedUsage(provider, usage);
@@ -281,13 +315,28 @@ export async function runRoutedProviderText(provider: RoutedProvider, messages: 
     : provider === "claude-code"
       ? claudeExecutor(messages, invocationId, onUsage, options?.mcpServerUrl)
       : openRouterExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage);
+  const timeoutMs = options?.timeoutMs ?? 120_000;
   let text = "";
-  for await (const event of result.fullStream) {
-    if (event.type === "text-delta" && typeof event.textDelta === "string") {
-      text += event.textDelta;
-      options?.onTextDelta?.(event.textDelta, text);
+  const consume = (async () => {
+    for await (const event of result.fullStream) {
+      if (event.type === "text-delta" && typeof event.textDelta === "string") {
+        text += event.textDelta;
+        options?.onTextDelta?.(event.textDelta, text);
+      }
     }
-  }
-  await result.response;
-  return text;
+    await result.response;
+    return text;
+  })();
+  const outcome = timeoutMs > 0
+    ? await Promise.race([
+      consume,
+      new Promise<never>((_resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`Routed ${provider} turn timed out after ${timeoutMs} ms.`)), timeoutMs);
+        timer.unref?.();
+        void consume.then(() => clearTimeout(timer), () => clearTimeout(timer));
+      }),
+    ])
+    : await consume;
+  if (outcome.trim().length === 0) throw new Error(`Routed ${provider} turn returned no text.`);
+  return outcome;
 }

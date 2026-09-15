@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { runRoutedProviderText } from "../host/extensions/inference/provider-session.js";
@@ -67,15 +67,28 @@ export function createCoordinatorInferenceRouter(options: {
   const persist = async (store: Store): Promise<void> => {
     await mkdir(dirname(storePath), { recursive: true });
     const temporary = `${storePath}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
-    await rename(temporary, storePath);
+    try {
+      await writeFile(temporary, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
+      await rename(temporary, storePath);
+    } catch (error) {
+      try { await unlink(temporary); } catch {}
+      throw error;
+    }
   };
-  const append = async (agentId: string, entries: readonly StoredEntry[]): Promise<Store> => {
+  // Serialize read-modify-write cycles so concurrent appends/reactions from
+  // different turns cannot silently drop each other's entries.
+  let storeChain: Promise<unknown> = Promise.resolve();
+  const withStoreLock = async <T>(work: () => Promise<T>): Promise<T> => {
+    const next = storeChain.catch(() => undefined).then(work);
+    storeChain = next.catch(() => undefined);
+    return next;
+  };
+  const append = async (agentId: string, entries: readonly StoredEntry[]): Promise<Store> => withStoreLock(async () => {
     const current = await load();
     const next: Store = { schemaVersion: 2, agents: { ...current.agents, [agentId]: [...(current.agents[agentId] ?? []), ...entries].slice(-200) } };
     await persist(next);
     return next;
-  };
+  });
   const emitTranscript = (agentId: string, type: "appended" | "updated", entry: Record<string, unknown>) => options.postEvent("transcript", { type, entry, agentId });
   const beginActivity = async (agentId: string): Promise<() => void> => {
     try {
@@ -99,7 +112,7 @@ export function createCoordinatorInferenceRouter(options: {
       };
     } catch { return () => {}; }
   };
-  const toggleLocalReaction = async (agentId: string, entryId: string, emoji: string): Promise<Record<string, unknown> | null> => {
+  const toggleLocalReaction = async (agentId: string, entryId: string, emoji: string): Promise<Record<string, unknown> | null> => withStoreLock(async () => {
     const trimmed = emoji.trim();
     if (agentId.length === 0 || entryId.length === 0 || trimmed.length === 0) return null;
     const current = await load();
@@ -117,7 +130,7 @@ export function createCoordinatorInferenceRouter(options: {
     nextEntries[index] = updated;
     await persist({ schemaVersion: 2, agents: { ...current.agents, [agentId]: nextEntries } });
     return projectInferenceRouterTranscriptEntry(updated);
-  };
+  });
   const execute = async (provider: Exclude<SandInferenceProvider, "cursor">, args: Record<string, unknown>) => {
     const agentId = typeof args.agentId === "string" ? args.agentId : "";
     const prompt = typeof args.prompt === "string" ? args.prompt : "";
@@ -206,7 +219,8 @@ export function createCoordinatorInferenceRouter(options: {
         const result = asRecord(remote);
         if (result == null || !Array.isArray(result.entries) || agentId.length === 0) return { handled: true, value: remote };
         const entries = [...result.entries, ...(local.agents[agentId] ?? []).map(projectInferenceRouterTranscriptEntry)];
-        const limit = typeof record.limit === "number" && Number.isInteger(record.limit) && record.limit > 0 ? record.limit : 500;
+        const requested = typeof record.limit === "number" && Number.isInteger(record.limit) && record.limit > 0 ? record.limit : 500;
+        const limit = Math.min(requested, 500);
         return { handled: true, value: { ...result, entries: entries.slice(-limit) } };
       }
       if (method !== "sendPrompt" || provider === "cursor") return { handled: false };
@@ -217,7 +231,9 @@ export function createCoordinatorInferenceRouter(options: {
         const timestampMs = now();
         const content = `Router error: ${error instanceof Error ? error.message : String(error)}`;
         if (agentId.length > 0) {
-          const id = `t${Date.now()}s0`;
+          // Keep error entries out of the t{turn}(u|s) namespace so the turn
+          // counter never interprets a wall-clock timestamp as a turn number.
+          const id = `t-error-${timestampMs}-${randomUUID().slice(0, 8)}`;
           await append(agentId, [{ provider, role: "assistant", content, id, timestampMs }]);
           emitTranscript(agentId, "appended", { kind: "send-message", id, message: { type: "text", content }, timestampMs });
         }

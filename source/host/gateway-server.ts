@@ -13,6 +13,11 @@ import { GATEWAY_PREPARE_UPGRADE_PATH, SAND_GATEWAY_COMMANDS, SAND_GATEWAY_SLIM_
 export class SandGatewayRequestError extends Error { constructor(message: string) { super(message); this.name = "SandGatewayRequestError"; } }
 export const GATEWAY_REQUEST_ID_HEADER = "x-sand-request-id"; export const SSE_HEARTBEAT_MS = 15_000; export const MAX_REQUEST_PAYLOAD_BYTES = 256 * 1024 * 1024; export const MAX_BODY_BYTES = Math.ceil(MAX_REQUEST_PAYLOAD_BYTES * 4 / 3) + 64 * 1024; export const GZIP_MIN_BYTES = 1_400; export const DISABLE_SSE_GZIP_ENV = "SAND_DISABLE_GATEWAY_SSE_GZIP";
 export function statusForCommandError(error: unknown): number { const name = error instanceof Error ? error.name : ""; return name === "SandAgentLimitError" || name === "SandSkillPublishError" ? 409 : 500; }
+export function statusForRequestError(error: unknown): number {
+  if (error instanceof SandGatewayRequestError) return 413;
+  if (error instanceof SyntaxError) return 400;
+  return statusForCommandError(error);
+}
 export async function readBody(req: AsyncIterable<unknown>): Promise<string> { const chunks: Buffer[] = []; let total = 0; for await (const chunk of req) { const buffer = chunk instanceof Buffer ? chunk : Buffer.from(chunk as ArrayBuffer); total += buffer.length; if (total > MAX_BODY_BYTES) throw new SandGatewayRequestError("Request body is too large."); chunks.push(buffer); } return Buffer.concat(chunks).toString("utf8"); }
 export function clientAcceptsGzip(req: IncomingMessage): boolean { const header = req.headers["accept-encoding"]; const value = Array.isArray(header) ? header.join(",") : header; return typeof value === "string" && value.toLowerCase().includes("gzip"); }
 export function clientWantsSlimAvatars(req: IncomingMessage): boolean { const header = req.headers[GATEWAY_SLIM_AVATARS_HEADER]; return (Array.isArray(header) ? header[0] : header) === "1"; }
@@ -41,7 +46,20 @@ function handleEvents(deps: GatewayServerDeps, req: IncomingMessage, res: Server
 const DATA_URL_PATTERN = /^data:([a-z0-9.+/-]+);base64,(.*)$/i; const AVATAR_NO_EXECUTE_HEADERS = { "content-disposition": "attachment", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; sandbox" };
 async function handleAvatarImage(deps: GatewayServerDeps, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> { if (req.headers["sec-fetch-site"] === "cross-site") return respondError(res, 403, "cross-site avatar loads are not allowed"); const agentId = decodeURIComponent(url.pathname.slice(GATEWAY_AVATARS_PATH.length + 1)); if (agentId.length === 0) return respondError(res, 404, "missing agent id"); const avatar = await deps.api.getAgentAvatar({ id: agentId }) as { dataUrl?: string | null; version?: string | null }; const match = avatar.dataUrl == null ? null : DATA_URL_PATTERN.exec(avatar.dataUrl); if (avatar.version == null || match?.[1] == null || match[2] == null) return respondError(res, 404, "agent has no avatar"); const requested = url.searchParams.get("v"); if (requested != null && requested !== avatar.version) return respondError(res, 404, "no such avatar version"); const etag = `"${avatar.version}"`; const cache = requested != null ? { "cache-control": "private, max-age=31536000, immutable", etag } : { "cache-control": "no-store", etag }; if (req.headers["if-none-match"] === etag) { res.writeHead(304, cache); res.end(); return; } const bytes = Buffer.from(match[2], "base64"); res.writeHead(200, { ...cache, ...AVATAR_NO_EXECUTE_HEADERS, "content-type": match[1], "content-length": bytes.byteLength }); res.end(bytes); }
 function handleBridgeRequests(bridge: GatewayServerDeps["localExec"] | GatewayServerDeps["webauthn"], missing: string, req: IncomingMessage, res: ServerResponse): void { if (bridge == null) return respondError(res, 404, missing); openSseStream(req, res, (write) => bridge.registerProvider((frame) => write(JSON.stringify(frame)))); }
-function handleBridgeResponses(bridge: GatewayServerDeps["localExec"] | GatewayServerDeps["webauthn"], missing: string, body: string, res: ServerResponse): void { if (bridge == null) return respondError(res, 404, missing); bridge.submitResponses(body.length > 0 ? JSON.parse(body) : {}); respondJson(res, { ok: true }); }
+function handleBridgeResponses(bridge: GatewayServerDeps["localExec"] | GatewayServerDeps["webauthn"], missing: string, body: string, res: ServerResponse): void {
+  if (bridge == null) return respondError(res, 404, missing);
+  let parsed: unknown = {};
+  if (body.length > 0) {
+    try { parsed = JSON.parse(body); }
+    catch { return respondError(res, 400, "bridge response body is not valid JSON"); }
+  }
+  try {
+    bridge.submitResponses(parsed);
+  } catch (error) {
+    return respondError(res, statusForCommandError(error), errorMessage(error));
+  }
+  respondJson(res, { ok: true });
+}
 
 export async function handleRequest(deps: GatewayServerDeps, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1"); if (rejectUntrustedBrowserRequest(deps, req, res)) return;
@@ -54,4 +72,4 @@ export async function handleRequest(deps: GatewayServerDeps, req: IncomingMessag
   return routeCommand(deps, url.pathname.slice(GATEWAY_API_PREFIX.length + 1), await readBody(req), res, req);
 }
 
-export async function startGatewayServer(deps: GatewayServerDeps) { const host = deps.host ?? "127.0.0.1"; const listener = (req: IncomingMessage, res: ServerResponse) => { void handleRequest(deps, req, res).catch((error) => { if (!res.headersSent) respondError(res, statusForCommandError(error), errorMessage(error)); else res.end(); }); }; const server = deps.tls == null ? createHttpServer(listener) : createHttpsServer({ cert: deps.tls.cert, key: deps.tls.key }, listener); await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(deps.port ?? 0, host, () => { server.off("error", reject); resolve(); }); }); const address = server.address(); if (address == null || typeof address === "string") throw new Error("gateway did not bind a TCP address"); return { port: address.port, close: () => new Promise<void>((resolve, reject) => { server.closeAllConnections(); server.close((error) => error != null ? reject(error) : resolve()); }) }; }
+export async function startGatewayServer(deps: GatewayServerDeps) { const host = deps.host ?? "127.0.0.1"; const listener = (req: IncomingMessage, res: ServerResponse) => { void handleRequest(deps, req, res).catch((error) => { if (!res.headersSent) respondError(res, statusForRequestError(error), errorMessage(error)); else res.end(); }); }; const server = deps.tls == null ? createHttpServer(listener) : createHttpsServer({ cert: deps.tls.cert, key: deps.tls.key }, listener); await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(deps.port ?? 0, host, () => { server.off("error", reject); resolve(); }); }); const address = server.address(); if (address == null || typeof address === "string") throw new Error("gateway did not bind a TCP address"); return { port: address.port, close: () => new Promise<void>((resolve, reject) => { server.closeAllConnections(); server.close((error) => error != null ? reject(error) : resolve()); }) }; }

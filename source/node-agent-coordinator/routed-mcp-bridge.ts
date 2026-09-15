@@ -43,17 +43,26 @@ export async function createRoutedMcpBridge(deps: {
   const secret = randomUUID();
   let tools = new Map<string, Tool>();
   const server = createServer(async (request, response) => {
-    if (request.method !== "POST" || request.url !== `/mcp/${secret}`) { response.writeHead(404).end(); return; }
-    let body = "";
+    if (request.method !== "POST" || request.url !== `/mcp/${secret}`) {
+      response.writeHead(request.method === "GET" && request.url === `/mcp/${secret}` ? 405 : 404).end();
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
     for await (const chunk of request) {
-      body += String(chunk);
-      if (body.length > 1_048_576) { response.writeHead(413).end(); return; }
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+      total += buffer.length;
+      if (total > 1_048_576) { response.writeHead(413).end(); request.destroy(); return; }
+      chunks.push(buffer);
     }
     let message: Record<string, any>;
-    try { message = JSON.parse(body) as Record<string, any>; }
+    try { message = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, any>; }
     catch { response.writeHead(400).end(); return; }
+    // JSON-RPC notifications carry no id and expect no reply body.
+    if (message.id === undefined || message.id === null) { response.writeHead(202).end(); return; }
     if (message.method === "notifications/initialized") { response.writeHead(202).end(); return; }
     const reply = (result: unknown) => { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result })); };
+    const replyError = (code: number, errorMessage: string) => { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code, message: errorMessage } })); };
     try {
       if (message.method === "initialize") { reply({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "grok-bot-plugins", version: "1" } }); return; }
       if (message.method === "tools/list") {
@@ -76,12 +85,14 @@ export async function createRoutedMcpBridge(deps: {
         reply(mcpResult(await deps.callTool({ ...selected, args: record(message.params)?.arguments ?? {}, toolCallId: randomUUID() })));
         return;
       }
-      reply({});
+      replyError(-32601, `Unknown method: ${String(message.method)}`);
     } catch (error) {
       reply({ isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] });
     }
   });
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  server.timeout = 30_000;
+  server.keepAliveTimeout = 5_000;
   const address = server.address();
   if (address == null || typeof address === "string") throw new Error("Could not bind the routed MCP bridge");
   return { url: `http://127.0.0.1:${address.port}/mcp/${secret}`, close: () => new Promise<void>((resolve, reject) => { server.closeAllConnections(); server.close(error => error == null ? resolve() : reject(error)); }) };
