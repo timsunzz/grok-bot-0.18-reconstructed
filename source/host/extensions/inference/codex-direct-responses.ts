@@ -1,3 +1,5 @@
+import { parseRetryAfterHeaderMs } from "../../../shared/retry-after.js";
+
 type Loose = Record<string, any>;
 
 export type CodexDirectUsage = {
@@ -42,7 +44,11 @@ function safeJson(value: unknown): string {
 async function responseError(response: Response): Promise<Error> {
   let detail = "";
   try { detail = (await response.text()).slice(0, 4_096).trim(); } catch {}
-  return new Error(`Codex direct request failed (${response.status}${detail.length === 0 ? "" : `: ${detail}`}).`);
+  const error = new Error(`Codex direct request failed (${response.status}${detail.length === 0 ? "" : `: ${detail}`}).`);
+  // The router classifies and paces its one retry from these, so what the response actually
+  // said outranks whatever can be scraped back out of the sentence above.
+  const retryAfterMs = parseRetryAfterHeaderMs(response.headers.get("retry-after"));
+  return Object.assign(error, { status: response.status, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) });
 }
 
 async function* sseEvents(response: Response): AsyncGenerator<Loose> {

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import { routedToolIsReadOnly } from "../shared/routed-tool-effects.js";
+
 type Tool = {
   readonly name: string;
   readonly providerIdentifier: string;
@@ -11,12 +13,6 @@ type Tool = {
 
 function record(value: unknown): Record<string, any> | null {
   return typeof value === "object" && value != null && !Array.isArray(value) ? value as Record<string, any> : null;
-}
-
-function isReadOnly(tool: Tool): boolean {
-  const label = `${tool.name} ${tool.toolName} ${tool.description ?? ""}`.toLowerCase();
-  return /(^|[^a-z])(read|search|find|list|get|fetch|query|lookup|inspect|view|download|retrieve)([^a-z]|$)/.test(label)
-    && !/(send|create|update|delete|remove|write|upload|post|reply|archive|move|rename|modify|cancel|purchase|buy)/.test(label);
 }
 
 function mcpResult(value: unknown): Record<string, unknown> {
@@ -72,7 +68,7 @@ export async function createRoutedMcpBridge(deps: {
           return [[row.name, row as Tool]];
         }));
         reply({ tools: [...tools.values()].map(tool => {
-          const readOnly = isReadOnly(tool);
+          const readOnly = routedToolIsReadOnly(tool);
           return { name: tool.name, description: tool.description ?? `${tool.toolName} via ${tool.providerIdentifier}`, inputSchema: record(tool.inputSchema) ?? { type: "object", additionalProperties: true }, annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: readOnly, openWorldHint: !readOnly } };
         }) });
         return;

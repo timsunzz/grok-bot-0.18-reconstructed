@@ -5,11 +5,11 @@ import { dirname, join } from "node:path";
 import { runRoutedProviderText } from "../host/extensions/inference/provider-session.js";
 import type { SandInferenceProvider } from "../shared/inference-router.js";
 import { SandSettingsStore } from "../shared/node/settings/sand-settings-store.js";
-import { classifyRoutedTurnFailure, formatRoutedTurnFailure, routedTurnRetryPolicy } from "../shared/routed-turn-failure.js";
+import { routedToolIsReadOnly } from "../shared/routed-tool-effects.js";
+import { classifyRoutedTurnFailure, formatRoutedTurnFailure, routedTurnRetryDelayMs, routedTurnRetryPolicy } from "../shared/routed-turn-failure.js";
 import { createRoutedMcpBridge } from "./routed-mcp-bridge.js";
 
 const TURN_ID_PATTERN = /^t(\d+)(?:u|s\d+)$/;
-const RETRY_BACKOFF_MS = 750;
 
 type StoredEntry = {
   readonly provider: Exclude<SandInferenceProvider, "cursor">;
@@ -176,41 +176,54 @@ export function createCoordinatorInferenceRouter(options: {
       emitTranscript(agentId, assistantStreamStarted ? "updated" : "appended", entry);
       assistantStreamStarted = true;
     };
-    const bridge = provider === "claude-code" ? await createRoutedMcpBridge({
-      listTools: () => options.dispatchRemote("listRoutedMcpTools", {}),
-      callTool: tool => options.dispatchRemote("executeRoutedMcpTool", { ...tool, agentId }),
-    }) : null;
-    const directTools = bridge == null ? await options.dispatchRemote("listRoutedMcpTools", {}) : undefined;
-    const tools = Array.isArray(directTools) ? directTools as Record<string, any>[] : undefined;
-    const onTextDelta = (_delta: string, accumulated: string) => emitAssistant(accumulated, true);
-    const attempt = () => runRoutedProviderText(provider, messages, bridge == null ? {
-      ...(tools === undefined ? {} : { tools }),
-      executeTool: async (definition, toolArgs, toolCallId) => await options.dispatchRemote("executeRoutedMcpTool", {
+    // Every routed tool call funnels through here, whichever transport carries it, so the retry
+    // gate sees one accounting of what this turn has already done.
+    let appliedWriteEffect = false;
+    const callRoutedTool = async (definition: Record<string, any>, toolArgs: unknown, toolCallId: string): Promise<unknown> => {
+      // Marked before dispatching, not after: a write whose transport died on the way back may
+      // still have landed, and that is exactly the case a retry must not replay.
+      if (!routedToolIsReadOnly(definition)) appliedWriteEffect = true;
+      return await options.dispatchRemote("executeRoutedMcpTool", {
         providerIdentifier: definition.providerIdentifier,
         name: definition.name,
         toolName: definition.toolName,
         args: toolArgs,
         toolCallId,
         agentId,
-      }),
+      });
+    };
+    const bridge = provider === "claude-code" ? await createRoutedMcpBridge({
+      listTools: () => options.dispatchRemote("listRoutedMcpTools", {}),
+      callTool: tool => callRoutedTool(tool, tool.args, tool.toolCallId),
+    }) : null;
+    const directTools = bridge == null ? await options.dispatchRemote("listRoutedMcpTools", {}) : undefined;
+    const tools = Array.isArray(directTools) ? directTools as Record<string, any>[] : undefined;
+    const onTextDelta = (_delta: string, accumulated: string) => emitAssistant(accumulated, true);
+    const attempt = () => runRoutedProviderText(provider, messages, bridge == null ? {
+      ...(tools === undefined ? {} : { tools }),
+      executeTool: callRoutedTool,
       onTextDelta,
     } : { mcpServerUrl: bridge.url, onTextDelta });
     try {
       try { content = await attempt(); }
       catch (error) {
-        // One retry, and only for classes a retry can actually fix. The same turn resumes;
-        // a retried turn never mints a new one.
-        if (routedTurnRetryPolicy(classifyRoutedTurnFailure(error)) !== "resume") throw error;
-        await new Promise<void>(resolve => setTimeout(resolve, RETRY_BACKOFF_MS));
+        // One retry, and only for classes a retry can actually fix on a turn that has not
+        // already changed something. The same turn resumes; a retried turn never mints a new
+        // one, and its assistant entry is rewritten rather than appended twice.
+        if (routedTurnRetryPolicy(classifyRoutedTurnFailure(error), { appliedWriteEffect }) !== "resume") throw error;
+        const delayMs = routedTurnRetryDelayMs(error);
+        if (delayMs == null) throw error;
+        await new Promise<void>(resolve => setTimeout(resolve, delayMs));
         content = await attempt();
       }
     } catch (error) {
       // Reported here rather than by the caller so the failure keeps this turn's own id
       // instead of inventing one.
-      const failure = formatRoutedTurnFailure(error);
+      const reason = classifyRoutedTurnFailure(error);
+      const failure = formatRoutedTurnFailure(error, reason, { appliedWriteEffect });
       await append(agentId, [{ provider, role: "assistant", content: failure, id: assistantId, timestampMs: assistantTimestampMs }]);
       emitAssistant(failure, false);
-      return { accepted: true, clientNonce, provider, reason: classifyRoutedTurnFailure(error) };
+      return { accepted: true, clientNonce, provider, reason };
     } finally { endActivity(); await bridge?.close(); }
     await append(agentId, [{ provider, role: "assistant", content, id: assistantId, timestampMs: assistantTimestampMs }]);
     emitAssistant(content, false);

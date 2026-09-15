@@ -105,7 +105,11 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(turnShell, /inferenceProvider === "cursor"/);
   assert.match(turnShell, /createProviderPromptSession\(inferenceProvider\)/);
   assert.match(coordinator, /method !== "sendPrompt" \|\| provider === "cursor"/);
-  assert.match(coordinator, /executeTool: async \(definition, toolArgs, toolCallId\)/);
+  // Both transports execute routed tools through one function, so the breaker and the retry gate
+  // cannot end up watching only the provider that happens to be selected.
+  assert.match(coordinator, /const callRoutedTool = async \(definition/);
+  assert.match(coordinator, /executeTool: callRoutedTool/);
+  assert.match(coordinator, /callTool: tool => callRoutedTool\(tool, tool\.args, tool\.toolCallId\)/);
   assert.match(coordinatorMain, /command\(commands, "listRoutedMcpTools", args\)/);
   assert.match(coordinator, /inference-router-transcript\.json/);
   assert.match(mcpBridge, /openWorldHint: !readOnly/);
