@@ -195,6 +195,8 @@ The main source areas are:
 - `tests/` — publication and router regressions.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for more detail.
+The agent/profile, routine, group-chat, and messaging model is compared with
+[Hermes Agent Bot Mode](docs/HERMES_BOT_MODE_COMPARISON.md).
 
 ## Development commands
 
