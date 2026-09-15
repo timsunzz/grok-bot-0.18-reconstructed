@@ -86,6 +86,33 @@ test("direct Codex Responses transport executes Grok Bot tools and continues wit
   assert.deepEqual(events.at(-1), { type: "done", text: "Subject", responseId: "resp-final", usage: { inputTokens: 28, outputTokens: 6, cacheReadTokens: 6, cacheWriteTokens: 0 } });
 });
 
+test("direct Codex Responses transport retries a transient 429 then honors abort", async () => {
+  const { streamCodexDirectResponses } = await loadModule();
+  const statuses = [];
+  const controller = new AbortController();
+  const fetch = async (_url, init) => {
+    statuses.push(init.signal?.aborted === true);
+    if (statuses.length === 1) return new Response("rate limited", { status: 429 });
+    controller.abort(new Error("stop"));
+    if (init.signal?.aborted) throw init.signal.reason;
+    return new Promise((_, reject) => {
+      init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+    });
+  };
+  await assert.rejects(async () => {
+    for await (const _event of streamCodexDirectResponses({
+      fetch,
+      endpoint: "https://example.invalid/responses",
+      model: "gpt-test",
+      instructions: "Grok",
+      input: [{ role: "user", content: "hi" }],
+      signal: controller.signal,
+      retryDelayMs: 0,
+    })) {}
+  }, /stop/);
+  assert.equal(statuses.length, 2);
+});
+
 test("direct Codex Responses transport fails closed on a truncated stream", async () => {
   const { streamCodexDirectResponses } = await loadModule();
   await assert.rejects(async () => {

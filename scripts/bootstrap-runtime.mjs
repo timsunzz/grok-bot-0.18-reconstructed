@@ -6,6 +6,7 @@ import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { archivedDmg, cachedDmg, cachedRuntimeApp, dmgSha256, dmgUrl } from "./lib/config.mjs";
+import { bootstrapCanExtractDmg, bootstrapUnsupportedPlatformMessage } from "./lib/bootstrap-platform.mjs";
 import { run } from "./lib/process.mjs";
 import { cacheRuntimeFromApp, hydrateSourcePayloadFromRuntime, validateRuntimeApp } from "./lib/runtime.mjs";
 import { SYSTEM_TOOLS } from "./lib/system-tools.mjs";
@@ -79,6 +80,9 @@ if (configuredApp) {
 } else if (await exists(cachedRuntimeApp)) {
   runtimeApp = await validateRuntimeApp(cachedRuntimeApp);
 } else {
+  if (!bootstrapCanExtractDmg(process.platform, { configuredApp: "", hasCachedRuntime: false })) {
+    throw new Error(bootstrapUnsupportedPlatformMessage());
+  }
   await downloadDmg();
   await extractRuntime();
   runtimeApp = await validateRuntimeApp(cachedRuntimeApp);

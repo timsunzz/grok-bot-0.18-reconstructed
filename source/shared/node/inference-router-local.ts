@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { constants, existsSync, lstatSync, readFileSync, accessSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
@@ -8,8 +8,19 @@ export interface LocalInferenceCliStatus {
   readonly executablePath: string | null;
 }
 
+export function isUsableExecutable(candidate: string): boolean {
+  try {
+    const stat = lstatSync(candidate);
+    if (!stat.isFile() && !stat.isSymbolicLink()) return false;
+    accessSync(candidate, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function firstExecutable(candidates: readonly (string | undefined)[]): string | null {
-  for (const candidate of candidates) if (candidate != null && candidate.length > 0 && existsSync(candidate)) return candidate;
+  for (const candidate of candidates) if (candidate != null && candidate.length > 0 && isUsableExecutable(candidate)) return candidate;
   return null;
 }
 

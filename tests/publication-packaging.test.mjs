@@ -114,7 +114,11 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(coordinator, /\.map\(projectInferenceRouterTranscriptEntry\)/);
   assert.match(coordinator, /readonly richText\?: string/);
   assert.match(coordinator, /richText: entry\.richText/);
-  assert.match(coordinator, /setTimeout\(resolve, 1_200\)/);
+  assert.match(coordinator, /DEFAULT_ROUTER_COMPOSE_DELAY_MS/);
+  assert.match(coordinator, /1_200/);
+  assert.match(coordinator, /withTurnTimeout/);
+  assert.match(coordinator, /turn_loop_guard/);
+  assert.match(coordinator, /toolLoop/);
   assert.match(coordinator, /method === "reactToMessage"/);
   assert.match(coordinator, /reaction\.by === "me"/);
   assert.match(coordinator, /currentActivity: \{ kind: "thinking" \}/);

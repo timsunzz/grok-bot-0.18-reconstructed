@@ -14,7 +14,7 @@ async function sha256(file) {
   return hash.digest("hex");
 }
 
-test("preserved 0.18.0 installers match the exact public release inventory", async () => {
+test("preserved 0.18.0 installers match the exact public release inventory", async (t) => {
   const manifest = JSON.parse(await readFile(path.join(archiveRoot, "artifacts.json"), "utf8"));
   assert.deepEqual(Object.keys(manifest).sort(), ["artifacts", "product", "schemaVersion", "version"]);
   assert.equal(manifest.schemaVersion, 1);
@@ -35,6 +35,13 @@ test("preserved 0.18.0 installers match the exact public release inventory", asy
     const metadata = await lstat(file);
     assert.equal(metadata.isFile(), true);
     assert.equal(metadata.isSymbolicLink(), false);
+    if (metadata.size !== artifact.bytes && metadata.size <= 1_024) {
+      const head = await readFile(file, "utf8");
+      if (head.startsWith("version https://git-lfs.github.com/spec/v1")) {
+        t.skip(`${artifact.path} is a Git LFS pointer; run git lfs pull to verify the preserved installer`);
+        continue;
+      }
+    }
     assert.equal(metadata.size, artifact.bytes, `${artifact.path} requires git lfs pull`);
     assert.equal(await sha256(file), artifact.sha256);
   }

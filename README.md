@@ -117,12 +117,16 @@ Remote mode remains the default.
 
 ## Requirements
 
-- macOS on Apple Silicon
-- Node.js 26.5.x
-- Xcode Command Line Tools
-- Git LFS
+- **Full app:** macOS on Apple Silicon, Xcode Command Line Tools, and the
+  checksum-pinned 0.18.0 runtime
+- **Toolchain (tests, typecheck, doctor):** Node.js 22.14 or newer
+- Git LFS (only if you want the preserved installer fixtures)
 - Docker Desktop (optional, only for the local sandbox)
 - local Claude Code or Codex authentication for those router choices
+
+`npm run doctor` prints whether this machine can run the toolchain, bootstrap
+the pinned runtime, or package the macOS app. On Linux the reconstructed
+`.app` cannot launch; the router tests and TypeScript checks still can.
 
 ## Quick start
 
@@ -199,6 +203,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for more detail.
 ## Development commands
 
 ```sh
+npm run doctor            # can this host run tests, bootstrap, or package?
 npm test                  # focused regression tests
 npm run typecheck         # renderer TypeScript
 npm run source:typecheck  # runtime TypeScript
@@ -208,6 +213,10 @@ npm run verify            # verify an existing packaged app
 npm run smoke             # bounded native smoke check
 npm run publication:check # prove a fresh-history export is lossless
 ```
+
+Routed inference now follows the same turn discipline as Hermes Agent Bot Mode
+(serial writes, typed retries, stall timeouts, tool/turn loop guards) without
+adopting Hermes' multi-bot roster. See [docs/HERMES-BOT-MODE.md](docs/HERMES-BOT-MODE.md).
 
 Generated directories including `.cache`, `.build`, `dist`, `src/app/dist`,
 `recovered`, `recovery`, and local probe roots are ignored.

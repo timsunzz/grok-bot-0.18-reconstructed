@@ -8,6 +8,7 @@ import { jsonSchema, streamText, tool, type CoreMessage, type LanguageModelV1, t
 
 import { BasePromptBuilder, BasePromptExecutor } from "../../../packages/chat-inference/base.js";
 import type { SandInferenceProvider } from "../../../shared/inference-router.js";
+import { abortControllerFromSignal, ToolLoopGuard } from "../../../shared/inference-router-runtime.js";
 import { resolveClaudeCodeCliPath } from "../../../shared/node/inference-router-local.js";
 import { getSandRootDir } from "../../host-paths.js";
 import { SandSettingsStore } from "../../../shared/node/settings/sand-settings-store.js";
@@ -46,6 +47,18 @@ function openRouterCredential(): string {
   const value = process.env.OPENROUTER_API_KEY?.trim() || persistedSecrets().OPENROUTER_API_KEY?.trim();
   if (value == null || value.length === 0) throw new Error("OpenRouter needs OPENROUTER_API_KEY. Add it in Settings → Router.");
   return value;
+}
+
+export function assertRoutedProviderReady(provider: RoutedProvider): void {
+  if (provider === "openrouter") {
+    openRouterCredential();
+    return;
+  }
+  if (provider === "claude-code") {
+    if (resolveClaudeCodeCliPath() == null) throw new Error("Claude Code is not installed. Install and sign in to Claude Code, then reopen Grok Bot.");
+    return;
+  }
+  codexCredentials();
 }
 
 function providerPrompt(messages: readonly ProviderMessage[]): string {
@@ -94,6 +107,7 @@ async function refreshCodexCredentials(current: CodexCredentials): Promise<Codex
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: current.refreshToken, client_id: clientId }),
+    signal: AbortSignal.timeout(20_000),
   });
   if (!refresh.ok) throw new Error("Codex login expired and could not be refreshed. Run `codex login` again.");
   const payload = await refresh.json() as Loose;
@@ -164,7 +178,7 @@ function codexTools(definitions: readonly Loose[] | undefined): CodexDirectTool[
   return tools.length === 0 ? undefined : tools;
 }
 
-function codexExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void) {
+function codexExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, abortSignal?: AbortSignal) {
   const credentials = codexCredentials();
   const usage = deferred<{ promptTokens: number; completionTokens: number; totalTokens: number }>();
   const extendedUsage = deferred<{ inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; maxTokens: number }>();
@@ -185,6 +199,7 @@ function codexExecutor(messages: readonly ProviderMessage[], invocationId: strin
         ...(tools == null ? {} : { tools }),
         ...(executeTool == null ? {} : { executeTool: async (selected, args, toolCallId) => await executeTool(selected.source, args, toolCallId) }),
         maxSteps: tools == null ? 1 : 8,
+        ...(abortSignal == null ? {} : { signal: abortSignal }),
       })) {
         if (event.type === "text-delta") { text += event.delta; yield { type: "text-delta" as const, textDelta: event.delta }; continue; }
         const basic = { promptTokens: event.usage.inputTokens, completionTokens: event.usage.outputTokens, totalTokens: event.usage.inputTokens + event.usage.outputTokens };
@@ -200,7 +215,17 @@ function codexExecutor(messages: readonly ProviderMessage[], invocationId: strin
   return { fullStream, response: resultResponse.promise, usage: usage.promise, extendedUsage: extendedUsage.promise, providerMetadata: metadata.promise, invocationId: Promise.resolve(invocationId) };
 }
 
-function claudeExecutor(messages: readonly ProviderMessage[], invocationId: string, onUsage?: (usage: UsageRecord) => void, mcpServerUrl?: string) {
+function claudeAssistantText(message: { message?: { content?: unknown } }): string {
+  const content = message.message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.flatMap(block => {
+    const row = typeof block === "object" && block != null ? block as Record<string, unknown> : null;
+    return row?.type === "text" && typeof row.text === "string" ? [row.text] : [];
+  }).join("");
+}
+
+function claudeExecutor(messages: readonly ProviderMessage[], invocationId: string, onUsage?: (usage: UsageRecord) => void, mcpServerUrl?: string, abortSignal?: AbortSignal) {
   const executable = resolveClaudeCodeCliPath();
   if (executable == null) throw new Error("Claude Code is not installed. Install and sign in to Claude Code, then reopen Grok Bot.");
   const usage = deferred<{ promptTokens: number; completionTokens: number; totalTokens: number }>();
@@ -211,11 +236,23 @@ function claudeExecutor(messages: readonly ProviderMessage[], invocationId: stri
     try {
       let final: SDKResultMessage | undefined;
       const selectedModel = process.env.SAND_CLAUDE_MODEL?.trim();
-      for await (const message of queryClaude({ prompt: providerPrompt(messages), options: { pathToClaudeCodeExecutable: executable, cwd: getSandRootDir(), tools: mcpServerUrl == null ? [] : ["mcp__grok_bot_plugins__*"], ...(mcpServerUrl == null ? {} : { mcpServers: { grok_bot_plugins: { type: "http" as const, url: mcpServerUrl } }, strictMcpConfig: true }), permissionMode: "default", maxTurns: mcpServerUrl == null ? 1 : 8, persistSession: false, ...(selectedModel == null || selectedModel.length === 0 ? {} : { model: selectedModel }) } })) if (message.type === "result") final = message;
+      const abortController = abortControllerFromSignal(abortSignal);
+      let streamed = "";
+      for await (const message of queryClaude({ prompt: providerPrompt(messages), options: { pathToClaudeCodeExecutable: executable, cwd: getSandRootDir(), tools: mcpServerUrl == null ? [] : ["mcp__grok_bot_plugins__*"], ...(mcpServerUrl == null ? {} : { mcpServers: { grok_bot_plugins: { type: "http" as const, url: mcpServerUrl } }, strictMcpConfig: true }), permissionMode: "default", maxTurns: mcpServerUrl == null ? 1 : 8, persistSession: false, abortController, ...(selectedModel == null || selectedModel.length === 0 ? {} : { model: selectedModel }) } })) {
+        if (message.type === "assistant") {
+          const next = claudeAssistantText(message);
+          if (next.length > streamed.length) {
+            const delta = next.slice(streamed.length);
+            streamed = next;
+            if (delta.length > 0) yield { type: "text-delta" as const, textDelta: delta };
+          }
+        }
+        if (message.type === "result") final = message;
+      }
       if (final == null) throw new Error("Claude Code ended without a result.");
-      if (final.subtype !== "success") throw new Error(final.errors.join("\n") || `Claude Code failed (${final.subtype}).`);
+      if (final.subtype !== "success") throw new Error(("errors" in final && Array.isArray(final.errors) ? final.errors.join("\n") : "") || `Claude Code failed (${final.subtype}).`);
       const text = final.result;
-      if (text.length > 0) yield { type: "text-delta" as const, textDelta: text };
+      if (text.length > streamed.length) yield { type: "text-delta" as const, textDelta: text.slice(streamed.length) };
       const input = final.usage.input_tokens, output = final.usage.output_tokens, cacheRead = final.usage.cache_read_input_tokens ?? 0, cacheWrite = final.usage.cache_creation_input_tokens ?? 0;
       onUsage?.({ inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite });
       usage.resolve({ promptTokens: input, completionTokens: output, totalTokens: input + output });
@@ -244,11 +281,11 @@ function toToolSet(definitions: readonly Loose[] | undefined, executeTool?: Rout
   return Object.keys(tools).length === 0 ? undefined : tools;
 }
 
-function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void) {
+function openRouterExecutor(messages: readonly ProviderMessage[], invocationId: string, definitions?: readonly Loose[], executeTool?: RoutedToolExecutor, onUsage?: (usage: UsageRecord) => void, abortSignal?: AbortSignal) {
   const id = process.env.SAND_OPENROUTER_MODEL?.trim() || "openai/gpt-5.2";
   const model: LanguageModelV1 = createOpenAI({ apiKey: openRouterCredential(), baseURL: "https://openrouter.ai/api/v1", compatibility: "compatible", name: "openrouter", headers: { "HTTP-Referer": "https://github.com/grok-bot-reconstructed", "X-Title": "Grok Bot Reconstructed" } }).chat(id as any);
   const tools = toToolSet(definitions, executeTool);
-  const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8 });
+  const result = streamText({ model, system: GROK_ROUTER_SYSTEM_PROMPT, messages: messages as CoreMessage[], ...(tools === undefined ? {} : { tools }), toolCallStreaming: true, maxSteps: tools === undefined ? 1 : 8, ...(abortSignal == null ? {} : { abortSignal }) });
   const extendedUsage = result.usage.then(value => ({ inputTokens: value.promptTokens, outputTokens: value.completionTokens, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 0 }));
   if (onUsage != null) void extendedUsage.then(onUsage);
   return { fullStream: result.fullStream, response: result.response, usage: result.usage, extendedUsage, providerMetadata: result.providerMetadata, invocationId: Promise.resolve(invocationId) };
@@ -273,14 +310,22 @@ export async function runRoutedProviderText(provider: RoutedProvider, messages: 
   readonly tools?: readonly Loose[];
   readonly executeTool?: RoutedToolExecutor;
   readonly onTextDelta?: (delta: string, accumulated: string) => void;
+  readonly abortSignal?: AbortSignal;
+  readonly toolLoop?: ToolLoopGuard;
 }): Promise<string> {
   const invocationId = crypto.randomUUID();
   const onUsage = (usage: UsageRecord) => recordRoutedUsage(provider, usage);
+  const loop = options?.toolLoop ?? new ToolLoopGuard();
+  const executeTool = options?.executeTool == null ? undefined : async (definition: Loose, args: unknown, toolCallId: string) => {
+    const admission = loop.admit(typeof definition.name === "string" ? definition.name : "unknown", args);
+    if (!admission.allowed) throw new Error(`Tool loop guard blocked repeated ${String(definition.name)} calls.`);
+    return await options.executeTool!(definition, args, toolCallId);
+  };
   const result = provider === "codex"
-    ? codexExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage)
+    ? codexExecutor(messages, invocationId, options?.tools, executeTool, onUsage, options?.abortSignal)
     : provider === "claude-code"
-      ? claudeExecutor(messages, invocationId, onUsage, options?.mcpServerUrl)
-      : openRouterExecutor(messages, invocationId, options?.tools, options?.executeTool, onUsage);
+      ? claudeExecutor(messages, invocationId, onUsage, options?.mcpServerUrl, options?.abortSignal)
+      : openRouterExecutor(messages, invocationId, options?.tools, executeTool, onUsage, options?.abortSignal);
   let text = "";
   for await (const event of result.fullStream) {
     if (event.type === "text-delta" && typeof event.textDelta === "string") {

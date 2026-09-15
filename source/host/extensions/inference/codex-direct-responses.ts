@@ -28,6 +28,8 @@ export type CodexDirectOptions = {
   readonly tools?: readonly CodexDirectTool[];
   readonly executeTool?: (tool: CodexDirectTool, args: unknown, toolCallId: string) => Promise<unknown>;
   readonly maxSteps?: number;
+  readonly signal?: AbortSignal;
+  readonly retryDelayMs?: number;
 };
 
 function record(value: unknown): Loose | null {
@@ -97,6 +99,36 @@ function toolCalls(output: readonly unknown[]): Loose[] {
   });
 }
 
+async function fetchCodexResponse(options: CodexDirectOptions, body: Loose): Promise<Response> {
+  const perform = () => options.fetch(options.endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream", "user-agent": "grok-bot-router/1" },
+    body: JSON.stringify(body),
+    ...(options.signal == null ? {} : { signal: options.signal }),
+  });
+  let response = await perform();
+  if (response.ok) return response;
+  if (response.status !== 429 && response.status < 500) throw await responseError(response);
+  try { await response.arrayBuffer(); } catch {}
+  if (options.signal?.aborted) throw options.signal.reason instanceof Error ? options.signal.reason : new Error("Aborted");
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, options.retryDelayMs ?? 750);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(options.signal?.reason instanceof Error ? options.signal.reason : new Error("Aborted"));
+    };
+    if (options.signal == null) return;
+    if (options.signal.aborted) {
+      onAbort();
+      return;
+    }
+    options.signal.addEventListener("abort", onAbort, { once: true });
+  });
+  response = await perform();
+  if (!response.ok) throw await responseError(response);
+  return response;
+}
+
 function requestTools(tools: readonly CodexDirectTool[] | undefined): Loose[] | undefined {
   if (tools == null || tools.length === 0) return undefined;
   return tools.map(tool => ({
@@ -117,22 +149,18 @@ export async function* streamCodexDirectResponses(options: CodexDirectOptions): 
   let usage: CodexDirectUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
 
   for (let step = 0; step < maxSteps; step += 1) {
+    if (options.signal?.aborted) throw options.signal.reason instanceof Error ? options.signal.reason : new Error("Aborted");
     const declaredTools = requestTools(options.tools);
-    const response = await options.fetch(options.endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "text/event-stream", "user-agent": "grok-bot-router/1" },
-      body: JSON.stringify({
-        model: options.model,
-        instructions: options.instructions,
-        input,
-        ...(declaredTools == null ? {} : { tools: declaredTools, tool_choice: "auto", parallel_tool_calls: true }),
-        ...(options.reasoningEffort == null ? {} : { reasoning: { effort: options.reasoningEffort, summary: "auto" } }),
-        include: ["reasoning.encrypted_content"],
-        stream: true,
-        store: false,
-      }),
+    const response = await fetchCodexResponse(options, {
+      model: options.model,
+      instructions: options.instructions,
+      input,
+      ...(declaredTools == null ? {} : { tools: declaredTools, tool_choice: "auto", parallel_tool_calls: true }),
+      ...(options.reasoningEffort == null ? {} : { reasoning: { effort: options.reasoningEffort, summary: "auto" } }),
+      include: ["reasoning.encrypted_content"],
+      stream: true,
+      store: false,
     });
-    if (!response.ok) throw await responseError(response);
 
     let completed: Loose | null = null;
     const observedOutput: Loose[] = [];
