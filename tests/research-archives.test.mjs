@@ -41,10 +41,11 @@ test("preserved 0.18.0 installers match the exact public release inventory", asy
 });
 
 test("bootstrap prefers the hash-pinned local archive before the network", async () => {
-  const [attributes, config, bootstrap] = await Promise.all([
+  const [attributes, config, bootstrap, workflow] = await Promise.all([
     readFile(path.join(repositoryRoot, ".gitattributes"), "utf8"),
     readFile(path.join(repositoryRoot, "scripts", "lib", "config.mjs"), "utf8"),
     readFile(path.join(repositoryRoot, "scripts", "bootstrap-runtime.mjs"), "utf8"),
+    readFile(path.join(repositoryRoot, ".github", "workflows", "check.yml"), "utf8"),
   ]);
   assert.match(attributes, /research-archives\/original\/\*\*\/\*\.dmg filter=lfs diff=lfs merge=lfs -text/);
   assert.match(attributes, /research-archives\/original\/\*\*\/\*\.exe filter=lfs diff=lfs merge=lfs -text/);
@@ -53,4 +54,9 @@ test("bootstrap prefers the hash-pinned local archive before the network", async
   assert.match(bootstrap, /if \(archivedDigest !== dmgSha256\)/);
   assert.match(bootstrap, /await copyFile\(archivedDmg, cachedDmg\)/);
   assert.ok(bootstrap.indexOf("await copyFile(archivedDmg, cachedDmg)") < bootstrap.indexOf("await fetch(dmgUrl"));
+  assert.match(
+    workflow,
+    /uses: actions\/checkout@v4\s+with:\s+lfs: true/,
+    "CI must hydrate the installer archives before verifying their bytes and hashes",
+  );
 });
