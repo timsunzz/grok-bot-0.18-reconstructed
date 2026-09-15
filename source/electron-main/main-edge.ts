@@ -2,6 +2,7 @@ import { isSandAgentModelSelection, resolveComputerUseModelSelection } from "../
 import { normalizeSandAutoReviewInstructions } from "../shared/sand-auto-review-instructions.js";
 import { isSandLocalToolAction, normalizeSandLocalToolPermission } from "../shared/local-tool-permission.js";
 import { isSandThemePreference } from "../shared/desktop.js";
+import { parseAgentIdList, parseSidebarSectionList } from "../shared/host-settings-input.js";
 import { isSandUpdateTrack } from "../shared/update-track.js";
 import { isValidIanaTimeZone } from "../shared/timezone.js";
 import { sandWebauthnProxyMirroredEnablement } from "../shared/webauthn-proxy-availability.js";
@@ -108,9 +109,9 @@ export function createMainEdgeHandlers(deps: MainEdgeDeps): HandlerMap {
     getComputerUseModel: () => computerUseModel(deps),
     setComputerUseModel: (raw) => { const requested = req(raw).model; const model = requested === null ? null : parseAgentModel(requested, true); if (requested === null || model != null) { invoke(deps.agentPrefsStore, "setComputerUseModel", model ?? undefined); void deps.syncHostSettingsToBox({ computerUseModel: invoke(deps.agentPrefsStore, "getComputerUseModel") ?? null }); } return computerUseModel(deps); },
     getHostPinnedAgents: async () => (await deps.readHostSettingsFromBox()).pinnedAgentIds ?? null,
-    setHostPinnedAgents: (raw) => echo(deps, "pinnedAgentIds", req(raw).pinnedAgentIds, "pinned agents"),
+    setHostPinnedAgents: async (raw) => { const ids = parseAgentIdList(req(raw).pinnedAgentIds); return ids == null ? (await deps.readHostSettingsFromBox()).pinnedAgentIds ?? null : await echo(deps, "pinnedAgentIds", ids, "pinned agents"); },
     getHostSidebarSections: async () => (await deps.readHostSettingsFromBox()).sidebarSections ?? null,
-    setHostSidebarSections: (raw) => echo(deps, "sidebarSections", req(raw).sections, "sidebar sections"),
+    setHostSidebarSections: async (raw) => { const sections = parseSidebarSectionList(req(raw).sections); return sections == null ? (await deps.readHostSettingsFromBox()).sidebarSections ?? null : await echo(deps, "sidebarSections", sections, "sidebar sections"); },
     getAvailableModels: () => deps.fetchAvailableModels(),
     getInferenceRouter: async () => { const settings = await deps.readHostSettingsFromBox().catch(() => ({} as UnknownRecord)); const provider = invoke(deps.settingsStore, "getInferenceProvider"); return { provider: isSandInferenceProvider(provider) ? provider : "cursor", usage: settings.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, local: getLocalInferenceCliStatus() }; },
     setInferenceRouter: async (raw) => { const provider = req(raw).provider; invariant(isSandInferenceProvider(provider), "Unknown inference provider."); invoke(deps.settingsStore, "setInferenceProvider", provider); const settings = await deps.syncHostSettingsToBox({ inferenceProvider: provider }).catch(() => null); return { provider, usage: settings?.inferenceRouterUsage ?? invoke(deps.settingsStore, "getInferenceRouterUsage") ?? null, local: getLocalInferenceCliStatus() }; },

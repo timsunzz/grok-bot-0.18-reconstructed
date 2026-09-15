@@ -4,7 +4,7 @@ import { getSandRootDir } from "../../host-paths.js";
 import { isSandAgentModelSelection, type SandAgentModelSelection } from "../../../shared/agents/sand-agent-model.js";
 import { normalizeSandLocalToolPermission, type SandLocalToolPermission } from "../../../shared/local-tool-permission.js";
 import type { SandAutoReviewInstructions } from "../../../shared/sand-auto-review-instructions.js";
-import type { SidebarSection } from "../../../shared/sidebar-sections.js";
+import { parseAgentIdList, parseSidebarSectionList } from "../../../shared/host-settings-input.js";
 import { SandSettingsStore } from "../../../shared/node/settings/sand-settings-store.js";
 import { isSandInferenceProvider, type SandInferenceProvider } from "../../../shared/inference-router.js";
 
@@ -14,8 +14,11 @@ export interface HostSettingsUpdate {
   notifications?: unknown; mcpCustomInstructions?: Record<string, string>; mcpCustomInstructionsByServerId?: Record<string, string>;
   mcpDisabledToolsByServerId?: Record<string, string[]>; mcpCustomInstructionsAccountScope?: string | null; mcpBoxServers?: string[];
   userTimeZone?: string; userTimeZoneOverride?: string; agentDefaultModel?: SandAgentModelSelection | null; computerUseModel?: SandAgentModelSelection | null;
-  autoReviewInstructions?: SandAutoReviewInstructions; localToolPermission?: unknown; webauthnProxyEnabled?: boolean; pinnedAgentIds?: string[];
-  sidebarSections?: SidebarSection[]; hasSeenOnboarding?: boolean; featureFlagOverrides?: Record<string, boolean>; inferenceProvider?: unknown;
+  autoReviewInstructions?: SandAutoReviewInstructions; localToolPermission?: unknown; webauthnProxyEnabled?: boolean;
+  // Like `notifications` and `localToolPermission`, these two arrive from off-process callers and
+  // are parsed rather than trusted, so the declared type stays as wide as the wire.
+  pinnedAgentIds?: unknown; sidebarSections?: unknown;
+  hasSeenOnboarding?: boolean; featureFlagOverrides?: Record<string, boolean>; inferenceProvider?: unknown;
 }
 
 export class SettingsService {
@@ -45,8 +48,8 @@ export class SettingsService {
     if (update.autoReviewInstructions !== undefined) this.store.setAutoReviewInstructions(update.autoReviewInstructions);
     if (update.localToolPermission !== undefined) this.store.setLocalToolPermission(normalizeSandLocalToolPermission(update.localToolPermission));
     if (update.webauthnProxyEnabled !== undefined) this.store.setWebauthnProxyEnabled(update.webauthnProxyEnabled);
-    if (update.pinnedAgentIds !== undefined) this.store.setPinnedAgentIds(update.pinnedAgentIds);
-    if (update.sidebarSections !== undefined) this.store.setSidebarSections(update.sidebarSections);
+    if (update.pinnedAgentIds !== undefined) { const ids = parseAgentIdList(update.pinnedAgentIds); if (ids != null) this.store.setPinnedAgentIds(ids); }
+    if (update.sidebarSections !== undefined) { const sections = parseSidebarSectionList(update.sidebarSections); if (sections != null) this.store.setSidebarSections(sections); }
     if (update.hasSeenOnboarding !== undefined) this.store.setHasSeenOnboarding(update.hasSeenOnboarding);
     if (isSandInferenceProvider(update.inferenceProvider)) this.store.setInferenceProvider(update.inferenceProvider);
     if (update.featureFlagOverrides !== undefined) for (const listener of [...this.featureFlagOverrideListeners]) listener(update.featureFlagOverrides);
