@@ -46,6 +46,7 @@ test("Router settings use the trusted backend and display recorded inference usa
   const codexDirect = await readFile(path.join(repoRoot, "source", "host", "extensions", "inference", "codex-direct-responses.ts"), "utf8");
   const turnShell = await readFile(path.join(repoRoot, "source", "host", "runner", "turn-run-shell.ts"), "utf8");
   const coordinator = await readFile(path.join(repoRoot, "source", "node-agent-coordinator", "inference-router.ts"), "utf8");
+  const routerRuntime = await readFile(path.join(repoRoot, "source", "shared", "inference-router-runtime.ts"), "utf8");
   const coordinatorMain = await readFile(path.join(repoRoot, "source", "node-agent-coordinator", "main.ts"), "utf8");
   const mcpBridge = await readFile(path.join(repoRoot, "source", "node-agent-coordinator", "routed-mcp-bridge.ts"), "utf8");
   const localDocker = await readFile(path.join(repoRoot, "source", "electron-main", "box", "local-docker-host-connector.ts"), "utf8");
@@ -115,7 +116,7 @@ test("Router settings use the trusted backend and display recorded inference usa
   assert.match(coordinator, /readonly richText\?: string/);
   assert.match(coordinator, /richText: entry\.richText/);
   assert.match(coordinator, /DEFAULT_ROUTER_COMPOSE_DELAY_MS/);
-  assert.match(coordinator, /1_200/);
+  assert.match(routerRuntime, /1_200/);
   assert.match(coordinator, /withTurnTimeout/);
   assert.match(coordinator, /turn_loop_guard/);
   assert.match(coordinator, /toolLoop/);

@@ -36,7 +36,7 @@ test("provider failures classify like Hermes bot-mode reason codes", async () =>
   const runtime = await loadRuntime();
   assert.equal(runtime.classifyProviderFailure(new Error("429 rate limit")), "provider_rate_limit");
   assert.equal(runtime.classifyProviderFailure(new Error("401 unauthorized")), "provider_auth_or_access");
-  assert.equal(runtime.classifyProviderFailure(new Error("OpenRouter needs OPENROUTER_API_KEY")), "provider_auth_or_access");
+  assert.equal(runtime.classifyProviderFailure(new Error("OpenRouter needs OPENROUTER_API_KEY")), "missing_config");
   assert.equal(runtime.classifyProviderFailure(new Error("Claude Code is not installed")), "missing_config");
   assert.equal(runtime.classifyProviderFailure(new Error("ECONNREFUSED 127.0.0.1")), "runtime_offline");
   assert.equal(runtime.classifyProviderFailure(new Error("Routed inference timed out after 10ms.")), "delivery_timeout");
