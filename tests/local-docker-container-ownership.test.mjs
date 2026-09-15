@@ -11,7 +11,7 @@ import { build } from "esbuild";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const IMAGE = "public.ecr.aws/k0i0n2g5/cursorenvironments/universal:sand-box-latest";
-const SCHEMA_VERSION = "6";
+const SCHEMA_VERSION = "7";
 
 const UNOWNED = JSON.stringify({ State: { Running: true }, Config: { Image: IMAGE, Labels: { "com.docker.compose.project": "someone-else" } } });
 const OWNED = JSON.stringify({ State: { Running: true }, Config: { Image: IMAGE, Labels: { "com.grok-bot.local-vm": "1" } } });

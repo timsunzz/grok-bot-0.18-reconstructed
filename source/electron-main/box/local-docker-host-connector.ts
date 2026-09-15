@@ -17,7 +17,7 @@ export const LOCAL_DOCKER_OWNER_LABEL = "com.grok-bot.local-vm=1";
 // Bumped whenever a container's fixed configuration gains something this app now depends on, so
 // containers from an earlier build are replaced for the reason that is actually true — they predate
 // the contract — rather than by whichever individual check the new configuration happens to fail.
-export const LOCAL_DOCKER_SCHEMA_VERSION = "6";
+export const LOCAL_DOCKER_SCHEMA_VERSION = "7";
 const READY_TIMEOUT_MS = 180_000;
 const OPTIONAL_CREDENTIAL_TIMEOUT_MS = 3_000;
 // `docker run` may pull an image, so lifecycle commands get a long deadline. The daemon probe
