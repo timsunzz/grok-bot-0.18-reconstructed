@@ -21,6 +21,9 @@ const OPTIONAL_CREDENTIAL_TIMEOUT_MS = 3_000;
 // behind a settings page must not sit there for two minutes.
 const DOCKER_COMMAND_TIMEOUT_MS = 120_000;
 const DOCKER_PROBE_TIMEOUT_MS = 10_000;
+const REPAIR_ATTEMPTS = 40;
+const REPAIR_POLL_MS = 50;
+const REPAIR_LOCK_STALE_MS = 10_000;
 
 export interface LocalDockerStatus {
   readonly available: boolean;
@@ -101,6 +104,43 @@ async function readToken(target: string): Promise<string | null> {
   } catch { return null; }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * A present-but-unparseable token file cannot be adopted, and it cannot be replaced the way an
+ * absent one is created: `wx` fails on it, and unconditional replacement lets every concurrent
+ * caller install a token of its own, so the gateway is handed several and accepts one. Repair
+ * therefore runs under a lock file, which is also a lock across the host, coordinator, and Electron
+ * main processes that share this directory. Callers that lose the lock adopt what the winner wrote.
+ */
+async function repairToken(target: string): Promise<string> {
+  const lock = `${target}.repair`;
+  for (let attempt = 0; attempt < REPAIR_ATTEMPTS; attempt++) {
+    const valid = await readToken(target);
+    if (valid != null) return valid;
+    try {
+      await writeFile(lock, `${process.pid}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    } catch (error) {
+      if ((error as { code?: unknown }).code !== "EEXIST") throw error;
+      // A process that died mid-repair would otherwise keep every later caller out for good.
+      const age = await stat(lock).then((info) => Date.now() - info.mtimeMs).catch(() => 0);
+      if (age > REPAIR_LOCK_STALE_MS) await rm(lock, { force: true }).catch(() => {});
+      else await sleep(REPAIR_POLL_MS);
+      continue;
+    }
+    try {
+      const token = randomBytes(32).toString("hex");
+      if (await readToken(target) == null) await replaceFileAtomically(target, tokenBody(token));
+      return await readToken(target) ?? token;
+    } finally {
+      await rm(lock, { force: true }).catch(() => {});
+    }
+  }
+  throw new Error(`Could not repair the local VM gateway token: ${target}.repair is held by another process. Remove it if no app is running.`);
+}
+
 /**
  * This token authenticates every request to the box's gateway, so no two callers may settle on
  * different values. Both `getLocalDockerStatus` behind the settings page and `ensureLocalDockerBox`
@@ -128,13 +168,7 @@ async function readOrCreateToken(settingsPath: string): Promise<string> {
   }
 
   const adopted = await readToken(target);
-  if (adopted != null) return adopted;
-
-  // The file is present but unreadable, so it has to be replaced rather than adopted. Whatever
-  // survives the replace is what the gateway will accept, even if another repair lands after it.
-  const repaired = randomBytes(32).toString("hex");
-  await replaceFileAtomically(target, tokenBody(repaired));
-  return await readToken(target) ?? repaired;
+  return adopted ?? await repairToken(target);
 }
 
 async function gatewayReady(token: string): Promise<boolean> {
@@ -147,41 +181,76 @@ async function gatewayReady(token: string): Promise<boolean> {
   } catch { return false; }
 }
 
-async function inspectContainer(): Promise<{ exists: boolean; running: boolean; owned: boolean; image: string; hostSha256: string; hasInferenceCredential: boolean; schemaVersion: string }> {
-  const result = await runDocker(["inspect", "--format", "{{json .}}", LOCAL_DOCKER_BOX_CONTAINER]);
-  if (!result.ok) return { exists: false, running: false, owned: false, image: "", hostSha256: "", hasInferenceCredential: false, schemaVersion: "" };
+// "Docker says this name is free" and "Docker could not tell us" are different answers, and the
+// difference decides whether a destructive lifecycle command on a fixed container name may run.
+// Collapsing them into one `exists: false` is what let a wedged daemon re-enable `rm --force`
+// against a container Grok Bot does not own.
+type ContainerState =
+  | { readonly kind: "absent" }
+  | { readonly kind: "unknown"; readonly detail: string }
+  | {
+    readonly kind: "present";
+    readonly running: boolean;
+    readonly owned: boolean;
+    readonly image: string;
+    readonly hostSha256: string;
+    readonly gatewayTokenSha256: string;
+    readonly hasInferenceCredential: boolean;
+    readonly schemaVersion: string;
+  };
+
+async function inspectContainer(timeoutMs?: number): Promise<ContainerState> {
+  const result = await runDocker(["inspect", "--format", "{{json .}}", LOCAL_DOCKER_BOX_CONTAINER], timeoutMs);
+  if (!result.ok) {
+    return /no such (?:object|container)/i.test(result.output)
+      ? { kind: "absent" }
+      : { kind: "unknown", detail: result.output || `Docker could not inspect ${LOCAL_DOCKER_BOX_CONTAINER}.` };
+  }
   try {
     const value = JSON.parse(result.output) as { State?: { Running?: unknown }; Config?: { Image?: unknown; Labels?: Record<string, unknown> } };
+    const labels = value.Config?.Labels ?? {};
+    const label = (name: string): string => typeof labels[name] === "string" ? labels[name] as string : "";
     return {
-      exists: true,
+      kind: "present",
       running: value.State?.Running === true,
-      owned: value.Config?.Labels?.["com.grok-bot.local-vm"] === "1",
+      owned: label("com.grok-bot.local-vm") === "1",
       image: typeof value.Config?.Image === "string" ? value.Config.Image : "",
-      hostSha256: typeof value.Config?.Labels?.["com.grok-bot.local-vm.host-sha256"] === "string" ? value.Config.Labels["com.grok-bot.local-vm.host-sha256"] as string : "",
-      hasInferenceCredential: value.Config?.Labels?.["com.grok-bot.local-vm.inference-credential"] === "1",
-      schemaVersion: typeof value.Config?.Labels?.["com.grok-bot.local-vm.schema-version"] === "string" ? value.Config.Labels["com.grok-bot.local-vm.schema-version"] as string : "",
+      hostSha256: label("com.grok-bot.local-vm.host-sha256"),
+      gatewayTokenSha256: label("com.grok-bot.local-vm.gateway-token-sha256"),
+      hasInferenceCredential: label("com.grok-bot.local-vm.inference-credential") === "1",
+      schemaVersion: label("com.grok-bot.local-vm.schema-version"),
     };
-  } catch { throw new Error("Docker returned malformed container inspection data."); }
+  } catch { return { kind: "unknown", detail: "Docker returned malformed container inspection data." }; }
 }
 
 export async function getLocalDockerStatus(settingsPath: string): Promise<LocalDockerStatus> {
-  const daemon = await runDocker(["info", "--format", "{{.ServerVersion}}"], DOCKER_PROBE_TIMEOUT_MS).catch(() => ({ ok: false, output: "Docker is not installed." }));
+  const daemon = await runDocker(["info", "--format", "{{.ServerVersion}}"], DOCKER_PROBE_TIMEOUT_MS);
   if (!daemon.ok) return { available: false, running: false, ready: false, containerName: LOCAL_DOCKER_BOX_CONTAINER, image: LOCAL_DOCKER_BOX_IMAGE, detail: daemon.output || "Docker is not running." };
-  const inspected = await inspectContainer();
-  if (!inspected.exists) return { available: true, running: false, ready: false, containerName: LOCAL_DOCKER_BOX_CONTAINER, image: LOCAL_DOCKER_BOX_IMAGE, detail: "Ready to create the local VM." };
+  // A daemon that answers `info` from cache while container operations hang is a common wedge, so
+  // the probe deadline has to cover the inspection too and not just the reachability check.
+  const inspected = await inspectContainer(DOCKER_PROBE_TIMEOUT_MS);
+  if (inspected.kind === "unknown") return { available: true, running: false, ready: false, containerName: LOCAL_DOCKER_BOX_CONTAINER, image: LOCAL_DOCKER_BOX_IMAGE, detail: inspected.detail };
+  if (inspected.kind === "absent") return { available: true, running: false, ready: false, containerName: LOCAL_DOCKER_BOX_CONTAINER, image: LOCAL_DOCKER_BOX_IMAGE, detail: "Ready to create the local VM." };
   if (!inspected.owned) return { available: true, running: inspected.running, ready: false, containerName: LOCAL_DOCKER_BOX_CONTAINER, image: inspected.image, detail: `Container ${LOCAL_DOCKER_BOX_CONTAINER} exists but is not owned by Grok Bot.` };
   const ready = inspected.running && await gatewayReady(await readOrCreateToken(settingsPath));
   return { available: true, running: inspected.running, ready, containerName: LOCAL_DOCKER_BOX_CONTAINER, image: inspected.image, detail: ready ? "Local Docker VM is ready." : inspected.running ? "Container is starting." : "Local Docker VM is stopped." };
 }
 
-let ensureInFlight: Promise<GatewayConnection> | undefined;
+let ensureInFlight: { readonly suppliesCredential: boolean; readonly promise: Promise<GatewayConnection> } | undefined;
 
 // One fixed container name means one provisioning pass at a time. The settings IPC path and the
 // coordinator reconnect path both provision, and overlapping `docker run --name` attempts make
 // one of them fail with a name conflict.
-function ensureSingleFlight(run: () => Promise<GatewayConnection>): Promise<GatewayConnection> {
-  if (ensureInFlight == null) ensureInFlight = run().finally(() => { ensureInFlight = undefined; });
-  return ensureInFlight;
+function ensureSingleFlight(suppliesCredential: boolean, run: () => Promise<GatewayConnection>): Promise<GatewayConnection> {
+  const current = ensureInFlight;
+  // A caller carrying an inference credential must not adopt a pass that was provisioning without
+  // one: the box it would join never received the credential, and the label the replace check
+  // reads reports nothing missing. It waits for that pass and then provisions on top of it.
+  if (current != null && (current.suppliesCredential || !suppliesCredential)) return current.promise;
+  const promise = (current == null ? run() : current.promise.catch(() => undefined).then(run))
+    .finally(() => { if (ensureInFlight?.promise === promise) ensureInFlight = undefined; });
+  ensureInFlight = { suppliesCredential, promise };
+  return promise;
 }
 
 async function isDirectory(path: string): Promise<boolean> {
@@ -233,30 +302,58 @@ async function localAuthMountArguments(): Promise<string[]> {
   return mounts;
 }
 
+// Why an existing owned container cannot serve this request. Each of these is baked in at
+// `docker run` and cannot be changed on a running container.
+function replacementReason(
+  present: Extract<ContainerState, { kind: "present" }>,
+  hostSha256: string,
+  gatewayTokenSha256: string,
+  needsInferenceCredential: boolean,
+): string | null {
+  if (present.schemaVersion !== LOCAL_DOCKER_SCHEMA_VERSION) return "it predates this app's local VM contract";
+  if (present.hostSha256 !== hostSha256) return "it runs a different app runtime";
+  // The gateway token is an environment variable of the container. A token this host has since
+  // repaired or rotated can only be adopted by replacing the container: otherwise every health
+  // probe gets 401 for the rest of that container's life and no reset path recovers it.
+  if (present.gatewayTokenSha256 !== gatewayTokenSha256) return "its gateway token is not the one this host now holds";
+  if (needsInferenceCredential && !present.hasInferenceCredential) return "it was created without an inference credential";
+  return null;
+}
+
 async function ensureLocalDockerBox(settingsPath: string, inferenceCredential?: InferenceCredential): Promise<GatewayConnection> {
   const token = await readOrCreateToken(settingsPath);
+  const gatewayTokenSha256 = createHash("sha256").update(token).digest("hex");
   const hostBundle = await stageCurrentHostBundle(settingsPath);
   const inferenceFile = inferenceCredential == null ? undefined : await persistInferenceCredential(settingsPath, inferenceCredential);
-  const daemon = await runDocker(["info", "--format", "{{.ServerVersion}}"]).catch(() => ({ ok: false, output: "Docker is not installed." }));
+  const daemon = await runDocker(["info", "--format", "{{.ServerVersion}}"], DOCKER_PROBE_TIMEOUT_MS);
   if (!daemon.ok) throw new Error(`Local Docker VM is selected, but Docker is unavailable: ${daemon.output || "start Docker and try again"}`);
   const inspected = await inspectContainer();
-  if (inspected.exists && !inspected.owned) throw new Error(`Local Docker VM cannot use ${LOCAL_DOCKER_BOX_CONTAINER}: an unowned container already has that name.`);
-  if (inspected.exists && inspected.image !== LOCAL_DOCKER_BOX_IMAGE) throw new Error(`Local Docker VM container uses unexpected image ${inspected.image}. Remove it explicitly before changing images.`);
-  if (inspected.exists && (inspected.schemaVersion !== LOCAL_DOCKER_SCHEMA_VERSION || inspected.hostSha256 !== hostBundle.sha256 || (inferenceCredential != null && !inspected.hasInferenceCredential))) {
-    const removed = await runDocker(["rm", "--force", LOCAL_DOCKER_BOX_CONTAINER]);
-    if (!removed.ok) throw new Error(`Could not replace the local VM with the current app runtime: ${removed.output}`);
+  if (inspected.kind === "unknown") throw new Error(`Local Docker VM cannot verify ${LOCAL_DOCKER_BOX_CONTAINER}: ${inspected.detail}`);
+  if (inspected.kind === "present" && !inspected.owned) throw new Error(`Local Docker VM cannot use ${LOCAL_DOCKER_BOX_CONTAINER}: an unowned container already has that name.`);
+  if (inspected.kind === "present" && inspected.image !== LOCAL_DOCKER_BOX_IMAGE) throw new Error(`Local Docker VM container uses unexpected image ${inspected.image}. Remove it explicitly before changing images.`);
+  let current: ContainerState = inspected;
+  if (inspected.kind === "present") {
+    const reason = replacementReason(inspected, hostBundle.sha256, gatewayTokenSha256, inferenceCredential != null);
+    if (reason != null) {
+      const removed = await runDocker(["rm", "--force", LOCAL_DOCKER_BOX_CONTAINER]);
+      if (!removed.ok) throw new Error(`Could not replace the local VM because ${reason}: ${removed.output}`);
+      current = { kind: "absent" };
+    }
   }
-  const shouldReplace = inspected.exists && (inspected.schemaVersion !== LOCAL_DOCKER_SCHEMA_VERSION || inspected.hostSha256 !== hostBundle.sha256 || (inferenceCredential != null && !inspected.hasInferenceCredential));
-  const current = shouldReplace ? await inspectContainer() : inspected;
-  if (current.exists && !current.running) {
+  // Only a container this pass started may be stopped again when provisioning gives up below.
+  let startedHere = false;
+  if (current.kind === "present" && !current.running) {
+    startedHere = true;
     const started = await runDocker(["start", LOCAL_DOCKER_BOX_CONTAINER]);
     if (!started.ok) throw new Error(`Could not start the local Docker VM: ${started.output}`);
-  } else if (!current.exists) {
+  } else if (current.kind === "absent") {
+    startedHere = true;
     const authMounts = await localAuthMountArguments();
     const created = await runDocker([
       "run", "--detach", "--name", LOCAL_DOCKER_BOX_CONTAINER,
       "--label", LOCAL_DOCKER_OWNER_LABEL, "--label", `com.grok-bot.local-vm.host-sha256=${hostBundle.sha256}`,
       "--label", `com.grok-bot.local-vm.box-exec-daemon-sha256=${hostBundle.boxExecDaemonSha256}`,
+      "--label", `com.grok-bot.local-vm.gateway-token-sha256=${gatewayTokenSha256}`,
       "--label", `com.grok-bot.local-vm.inference-credential=${inferenceCredential == null ? "0" : "1"}`,
       "--label", `com.grok-bot.local-vm.schema-version=${LOCAL_DOCKER_SCHEMA_VERSION}`,
       "--platform", "linux/amd64", "--restart", "unless-stopped",
@@ -277,24 +374,28 @@ async function ensureLocalDockerBox(settingsPath: string, inferenceCredential?: 
   let failure = "Local Docker VM did not expose its gateway within three minutes.";
   while (Date.now() < deadline) {
     if (await gatewayReady(token)) return { baseUrl: LOCAL_DOCKER_GATEWAY_URL, token };
-    const state = await inspectContainer().catch(() => null);
-    if (state == null || !state.running) {
+    const state = await inspectContainer();
+    // An inspection that could not answer is not evidence the container died, and the gateway
+    // probe above is the authority on readiness, so a wedged `inspect` keeps waiting instead of
+    // tearing down a box that is still coming up.
+    if (state.kind === "absent" || (state.kind === "present" && !state.running)) {
       const logs = await runDocker(["logs", "--tail", "80", LOCAL_DOCKER_BOX_CONTAINER]);
       failure = `Local Docker VM stopped before its gateway became ready.\n${logs.output}`;
       break;
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
-  // Callers roll the box runtime back to remote when this throws, so a container left running
-  // here would keep holding the loopback ports and CPU with nothing attached to it. Stopping
-  // rather than removing keeps the logs and volumes available for diagnosis.
-  await stopOwnedContainerQuietly();
+  // Callers roll the box runtime back to remote when this throws, so a container this pass started
+  // would keep holding the loopback ports and CPU with nothing attached to it. A box that was
+  // already running is left alone: it belongs to whoever started it. Stopping rather than removing
+  // keeps the logs and volumes available for diagnosis.
+  if (startedHere) await stopOwnedContainerQuietly();
   throw new Error(failure);
 }
 
 async function stopOwnedContainerQuietly(): Promise<void> {
-  const inspected = await inspectContainer().catch(() => null);
-  if (inspected == null || !inspected.exists || !inspected.owned || !inspected.running) return;
+  const inspected = await inspectContainer();
+  if (inspected.kind !== "present" || !inspected.owned || !inspected.running) return;
   await runDocker(["stop", "--time", "10", LOCAL_DOCKER_BOX_CONTAINER]);
 }
 
@@ -302,18 +403,23 @@ async function stopOwnedContainerQuietly(): Promise<void> {
 // own. The recreate paths run `restart` and `rm --force` on a fixed name, so they need the
 // same guard or a user's unrelated container of that name is destroyed for them.
 async function unownedContainerRefusal(action: string): Promise<string | null> {
-  const inspected = await inspectContainer().catch(() => null);
-  if (inspected == null || !inspected.exists || inspected.owned) return null;
-  return `Refusing to ${action} ${LOCAL_DOCKER_BOX_CONTAINER}: an unowned container already has that name.`;
+  const inspected = await inspectContainer();
+  if (inspected.kind === "absent") return null;
+  // Ownership has to be confirmed, not merely not-denied: `docker inspect` failing to answer is no
+  // evidence that destroying this name is safe.
+  if (inspected.kind === "unknown") return `Refusing to ${action} ${LOCAL_DOCKER_BOX_CONTAINER}: Docker could not confirm who owns it (${inspected.detail}).`;
+  return inspected.owned ? null : `Refusing to ${action} ${LOCAL_DOCKER_BOX_CONTAINER}: an unowned container already has that name.`;
 }
 
 export async function startLocalDockerBox(settingsPath: string): Promise<GatewayConnection> {
-  return await ensureSingleFlight(() => ensureLocalDockerBox(settingsPath));
+  return await ensureSingleFlight(false, () => ensureLocalDockerBox(settingsPath));
 }
 
 export async function stopLocalDockerBox(): Promise<void> {
   const inspected = await inspectContainer();
-  if (!inspected.exists || !inspected.running) return;
+  if (inspected.kind === "absent") return;
+  if (inspected.kind === "unknown") throw new Error(`Could not stop the local Docker VM: Docker could not confirm the container's state (${inspected.detail}).`);
+  if (!inspected.running) return;
   if (!inspected.owned) throw new Error(`Refusing to stop unowned container ${LOCAL_DOCKER_BOX_CONTAINER}.`);
   const stopped = await runDocker(["stop", LOCAL_DOCKER_BOX_CONTAINER]);
   if (!stopped.ok) throw new Error(`Could not stop the local Docker VM: ${stopped.output}`);
@@ -323,7 +429,7 @@ export function createSettingsRoutedHostConnector(
   remote: SandRemoteHostConnector,
   settings: SandSettingsStore,
 ): SandRemoteHostConnector {
-  const localConnect = (): Promise<GatewayConnection> => ensureSingleFlight(async () => {
+  const localConnect = (): Promise<GatewayConnection> => ensureSingleFlight(remote.issueInferenceCredential != null, async () => {
     const issued = remote.issueInferenceCredential == null ? undefined : await Promise.race([
       remote.issueInferenceCredential(),
       new Promise<undefined>((resolve) => setTimeout(resolve, OPTIONAL_CREDENTIAL_TIMEOUT_MS)),
