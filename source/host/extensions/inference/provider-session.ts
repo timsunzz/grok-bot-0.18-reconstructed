@@ -283,7 +283,14 @@ function toToolSet(definitions: readonly Loose[] | undefined, executeTool?: Rout
       ...(typeof definition.description === "string" ? { description: definition.description } : {}),
       parameters: jsonSchema(parameters),
     };
-    if (executeTool != null) routedTool.execute = async (args: unknown, options: { toolCallId: string }) => await executeTool(definition, args, options.toolCallId);
+    // A rejecting `execute` reaches `streamText` as an error part, which fails the whole turn and
+    // discards the answer the model had already streamed. One unreachable plugin is not the end of
+    // a turn: the Codex transport and the Claude Code bridge both hand the model an `isError`
+    // result and let it carry on, so this one does too.
+    if (executeTool != null) routedTool.execute = async (args: unknown, options: { toolCallId: string }) => {
+      try { return await executeTool(definition, args, options.toolCallId); }
+      catch (error) { return { isError: true, error: error instanceof Error ? error.message : String(error) }; }
+    };
     tools[definition.name] = tool(routedTool);
   }
   return Object.keys(tools).length === 0 ? undefined : tools;

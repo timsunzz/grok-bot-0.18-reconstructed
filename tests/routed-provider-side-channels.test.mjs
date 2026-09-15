@@ -46,6 +46,18 @@ function sse(body) {
   return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
+// One OpenAI-compatible streamed completion, which is what OpenRouter answers with.
+function completion(deltas) {
+  const chunks = deltas.map(([delta, finishReason]) => `data: ${JSON.stringify({
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "openai/gpt-5.2",
+    choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
+  })}\n\n`);
+  return sse(`${chunks.join("")}data: [DONE]\n\n`);
+}
+
 function truncatedStream() {
   return sse('data: {"type":"response.output_text.delta"');
 }
@@ -186,6 +198,39 @@ test("a routed OpenRouter turn issues one provider request per attempt", { timeo
     // provider requests, three of them back to back inside the first attempt before any header
     // was read.
     assert.equal(requests, 1);
+    assert.deepEqual(observed, []);
+  } finally {
+    delete process.env.OPENROUTER_API_KEY;
+    await loaded.dispose();
+  }
+});
+
+test("a plugin that cannot be reached dents a routed turn rather than failing it", { timeout: 30_000 }, async () => {
+  const loaded = await loadProviderSession();
+  process.env.OPENROUTER_API_KEY = "test-key";
+  try {
+    const bodies = [];
+    let answer = null;
+    const observed = await withoutUnhandledRejections(() => withStubbedFetch(async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      return bodies.length === 1
+        ? completion([[{ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "gmail_search", arguments: "{}" } }] }], [{}, "tool_calls"]])
+        : completion([[{ content: "Gmail is not answering right now." }], [{}, "stop"]]);
+    }, async () => {
+      answer = await loaded.module.runRoutedProviderText("openrouter", [{ role: "user", content: "any mail?" }], {
+        tools: [{ name: "gmail_search", description: "Search Gmail", inputSchema: { type: "object", properties: {} } }],
+        executeTool: async () => { throw new Error("The Gmail plugin is unreachable."); },
+      });
+    }));
+
+    // A rejecting tool reaches the SDK as an error part, which used to abort the turn and discard
+    // the answer with it: one unplugged account cost the whole reply. The model is told the call
+    // failed and gets to answer around it, which is what the other two transports already did.
+    assert.equal(answer, "Gmail is not answering right now.");
+    assert.equal(bodies.length, 2, "the model has to be given the failure to answer around");
+    const returned = bodies[1].messages.filter((message) => message.role === "tool");
+    assert.equal(returned.length, 1);
+    assert.match(returned[0].content, /unreachable/);
     assert.deepEqual(observed, []);
   } finally {
     delete process.env.OPENROUTER_API_KEY;
