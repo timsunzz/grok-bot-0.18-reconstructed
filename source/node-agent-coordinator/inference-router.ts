@@ -274,9 +274,10 @@ export function createCoordinatorInferenceRouter(options: {
       emitAssistant(content, false);
       return { accepted: true, clientNonce, provider };
     } finally {
-      // Neither of these may replace what the turn is already reporting on its way out.
+      // Neither of these may replace what the turn is already reporting on its way out, and either
+      // can fail synchronously as well as asynchronously.
       try { endActivity(); } catch {}
-      await bridge?.close().catch(() => {});
+      try { await bridge?.close(); } catch {}
     }
   };
 
